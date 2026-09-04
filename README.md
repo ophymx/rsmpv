@@ -6,8 +6,9 @@ media player.
 These crates were written **only** from the ISC-licensed client API headers
 of the mpv project (`client.h`, `render.h`, `render_gl.h`, `stream_cb.h`) —
 which exist expressly to enable third-party wrappers — without reference to
-any existing LGPL Rust binding. The crates themselves are ISC licensed, so
-the license encumbrance added on top of libmpv itself is minimal.
+any existing LGPL Rust binding. `rsmpv-sys` is ISC licensed like the headers
+it derives from, and `rsmpv` is MIT OR Apache-2.0, so the license
+encumbrance added on top of libmpv itself is minimal.
 
 > **Note**: the mpv *library* you link against is GPLv2+ by default, or
 > LGPLv2.1+ when mpv is built with `-Dgpl=false`. These bindings don't (and
