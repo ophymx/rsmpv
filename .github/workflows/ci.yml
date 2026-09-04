@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Lint and test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libmpv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libmpv-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Test
+        # Headless: the integration tests run a real libmpv with vo=null/ao=null.
+        run: cargo test --workspace --all-features
+      - name: Feature matrix
+        run: |
+          cargo build -p rsmpv-sys --no-default-features
+          cargo build -p rsmpv --no-default-features
+          cargo build -p rsmpv --features render
+          cargo build -p rsmpv --features stream-cb
+      - name: Docs
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: Check (MSRV 1.77)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libmpv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libmpv-dev pkg-config
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.77"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --all-features --all-targets
