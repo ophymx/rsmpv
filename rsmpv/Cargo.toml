@@ -1,6 +1,6 @@
 [package]
 name = "rsmpv"
-version = "0.1.0"
+version = "0.1.1"
 description = "Safe, idiomatic Rust bindings for libmpv, built on the ISC-licensed mpv client headers"
 license = "MIT OR Apache-2.0"
 keywords = ["mpv", "libmpv", "video", "multimedia", "player"]
@@ -19,7 +19,7 @@ render = ["rsmpv-sys/render"]
 stream-cb = ["rsmpv-sys/stream-cb"]
 
 [dependencies]
-rsmpv-sys = { version = "0.1.0", path = "../rsmpv-sys", default-features = false }
+rsmpv-sys = { version = "0.1.1", path = "../rsmpv-sys", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true

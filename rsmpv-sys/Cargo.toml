@@ -1,6 +1,6 @@
 [package]
 name = "rsmpv-sys"
-version = "0.1.0"
+version = "0.1.1"
 description = "Low-level FFI bindings for the libmpv client API, written from the ISC-licensed mpv client headers"
 license = "ISC"
 links = "mpv"
