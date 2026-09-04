@@ -30,8 +30,8 @@ fn video_core() -> Mpv {
 /// Queue the synthetic lavfi source. `loadfile` only queues the load, so
 /// this succeeds even on mpv builds without lavfi — those surface as an
 /// [`Event::EndFile`] carrying [`Error::LoadingFailed`] later, which
-/// [`pump_until_rendered`] reports as [`Pump::LoadFailed`] (the skip
-/// path).
+/// [`pump_until_rendered`] turns into a skip (or a failure under
+/// `RSMPV_STRICT_TESTS`).
 fn load_test_video(mpv: &Mpv) {
     mpv.command(&["loadfile", "av://lavfi:testsrc=duration=1:size=64x64"])
         .unwrap();
@@ -63,8 +63,10 @@ fn pump_until_rendered(
                 // by reloading it emit one per lap, so only errors end
                 // the pump.
                 assert_eq!(e, Error::LoadingFailed, "playback failed");
+                let strict = std::env::var_os("RSMPV_STRICT_TESTS")
+                    .is_some_and(|v| !v.is_empty() && v != "0");
                 assert!(
-                    std::env::var_os("RSMPV_STRICT_TESTS").is_none(),
+                    !strict,
                     "lavfi source failed to load under RSMPV_STRICT_TESTS"
                 );
                 eprintln!("skipping: this mpv can't play the lavfi source");

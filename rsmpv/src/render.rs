@@ -130,9 +130,15 @@ pub enum SwPixelFormat {
 
 impl SwPixelFormat {
     fn bytes_per_pixel(self) -> usize {
+        // Exhaustive on purpose: this feeds the buffer-size check that
+        // keeps render_software a safe fn, so a future variant must state
+        // its size here instead of inheriting a wildcard's.
         match self {
+            SwPixelFormat::Rgb0
+            | SwPixelFormat::Bgr0
+            | SwPixelFormat::ZeroBgr
+            | SwPixelFormat::ZeroRgb => 4,
             SwPixelFormat::Rgb24 => 3,
-            _ => 4,
         }
     }
 
@@ -172,6 +178,10 @@ impl RenderInner {
         advanced_control: bool,
         get_proc_address: GetProcAddress,
     ) -> Result<RenderInner> {
+        // The double box is load-bearing: `ctx` must be a thin pointer,
+        // so mpv is handed the address of the fat `Box<dyn>` itself (the
+        // trampoline reads it as `&mut GetProcAddress`). The outer
+        // allocation is what EscapedBox owns.
         let gpa = EscapedBox::new(Box::new(get_proc_address));
         let mut init = rsmpv_sys::mpv_opengl_init_params {
             get_proc_address: Some(get_proc_address_trampoline),
@@ -231,8 +241,13 @@ impl RenderInner {
             mpv,
             params.as_mut_ptr(),
         ))?;
-        let raw = NonNull::new(raw)
-            .expect("mpv_render_context_create returned success without a context");
+        let Some(raw) = NonNull::new(raw) else {
+            // Contract violated (success without a context): whether mpv
+            // retained the closure pointer is unknowable, so leak the
+            // closure rather than free it during the unwind.
+            std::mem::forget(get_proc_address);
+            panic!("mpv_render_context_create returned success without a context");
+        };
         Ok(RenderInner {
             raw,
             _get_proc_address: get_proc_address,
@@ -498,6 +513,13 @@ pub type OwnedRenderContext = RenderContext<Arc<Mpv>>;
 // as a conservative thread-affinity guard.
 unsafe impl Send for RenderContext<Arc<Mpv>> {}
 
+// Structurally tie the impl above to the bound it relies on: this stops
+// compiling if <Arc<Mpv> as CoreRef>::GetProcAddress ever loses `+ Send`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<<Arc<Mpv> as CoreRef>::GetProcAddress>();
+};
+
 impl<C: CoreRef> RenderContext<C> {
     /// The raw `mpv_render_context` pointer, for use with
     /// [`sys`](crate::sys) as an escape hatch. Valid as long as `self` is.
@@ -610,6 +632,11 @@ impl<C: CoreRef> RenderContext<C> {
     /// to call [`update`](Self::update) promptly after every update
     /// callback — see `MPV_RENDER_PARAM_ADVANCED_CONTROL`.
     ///
+    /// On error the passed `core` is dropped with the rest of the failed
+    /// construction — for an `Arc` core, pass a clone (as usual) so a
+    /// failure can't release your last reference, whose drop would run
+    /// blocking player termination.
+    ///
     /// # Safety
     /// GL-context currency is a dynamic, per-call rule the type system
     /// cannot capture, so by calling this you take it on as an obligation:
@@ -640,9 +667,11 @@ impl<C: CoreRef> RenderContext<C> {
 
     /// Create a software renderer that draws into caller-provided memory
     /// via [`render_software`](Self::render_software). `core` is a `&Mpv`
-    /// borrow or an `Arc<Mpv>` (see [`CoreRef`]). Simple but slow
-    /// (everything runs on one CPU thread); mpv recommends it only as a
-    /// last resort.
+    /// borrow or an `Arc<Mpv>` (see [`CoreRef`]); on error it is dropped
+    /// with the rest of the failed construction, so for an `Arc` core
+    /// pass a clone (as usual) rather than your last reference. Simple
+    /// but slow (everything runs on one CPU thread); mpv recommends it
+    /// only as a last resort.
     pub fn new_software(core: C) -> Result<RenderContext<C>> {
         // SAFETY: the handle is valid, and the `core` field (borrow or
         // Arc) keeps the core alive for the inner's lifetime.

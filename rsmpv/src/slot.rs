@@ -28,8 +28,9 @@ type Slot = Mutex<Option<Callback>>;
 ///   teardown-ordering argument is needed for memory safety.
 ///
 /// Dropping the `CallbackSlot` only releases the owner's reference. The
-/// wrapper `Drop` impls empty the slot first (via their take-callback
-/// paths); a closure left behind would merely leak with the slot.
+/// wrapper `Drop` impls empty the slot first (via their
+/// [`teardown`](CallbackSlot::teardown) paths); a closure left behind
+/// would merely leak with the slot.
 ///
 /// # Locking and lifetime of closures
 /// [`trampoline`](CallbackSlot::trampoline) clones the stored `Arc` under
