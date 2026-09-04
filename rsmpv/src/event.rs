@@ -76,7 +76,7 @@ pub struct LogMessage {
 }
 
 /// An owned libmpv event, as returned by
-/// [`Handle::wait_event`](crate::Handle::wait_event).
+/// [`Mpv::wait_event`](crate::Mpv::wait_event).
 ///
 /// All data is deep-copied out of libmpv's event storage, so events can be
 /// kept and sent across threads freely.

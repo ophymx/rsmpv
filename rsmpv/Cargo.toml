@@ -1,6 +1,6 @@
 [package]
 name = "rsmpv"
-version = "0.1.1"
+version = "0.2.0"
 description = "Safe, idiomatic Rust bindings for libmpv, built on the ISC-licensed mpv client headers"
 license = "MIT OR Apache-2.0"
 keywords = ["mpv", "libmpv", "video", "multimedia", "player"]

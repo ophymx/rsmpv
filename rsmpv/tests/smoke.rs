@@ -270,3 +270,202 @@ fn overreporting_stream_is_clamped() {
         _ => None,
     });
 }
+
+/// poll_event composes with shared ownership: no `&mut Mpv` anywhere, and
+/// draining works from another thread through the same Arc.
+#[test]
+fn poll_event_from_shared_reference() {
+    use std::sync::Arc;
+
+    let mpv = Arc::new(headless());
+    mpv.observe_property(21, "volume", Format::Double).unwrap();
+
+    let drained = {
+        let mpv = Arc::clone(&mpv);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Some(Event::PropertyChange { userdata: 21, .. }) = mpv.poll_event() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        })
+    };
+    assert!(drained.join().unwrap(), "no event drained via &self");
+
+    // Empty queue: poll never blocks and reports None.
+    while mpv.poll_event().is_some() {}
+    assert!(mpv.poll_event().is_none());
+}
+
+/// Increments its counter when dropped; for asserting a closure the
+/// library owns is released exactly once.
+struct CountDrop(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Teardown-ordering regression: dropping the player releases the wakeup
+/// closure, and a panic in that closure's Drop (arbitrary user code) must
+/// not skip core termination — it surfaces out of drop(mpv) only after
+/// the core is dead, leaving the process healthy.
+#[test]
+fn panicking_wakeup_closure_drop_does_not_wedge_teardown() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                panic!("panic from wakeup closure Drop");
+            }
+        }
+    }
+
+    let mpv = headless();
+    let guard = PanicOnDrop;
+    mpv.set_wakeup_callback(move || {
+        let _keepalive = &guard;
+    });
+
+    let result = catch_unwind(AssertUnwindSafe(move || drop(mpv)));
+    assert!(result.is_err(), "closure Drop panic should escape drop(mpv)");
+
+    // The core was torn down before the panic escaped; the library must
+    // still be fully usable.
+    let again = headless();
+    assert!(again.get_property::<f64>("volume").is_ok());
+}
+
+/// The stored wakeup closure is released exactly once when the player
+/// drops — no leak, no double free. Release can trail an in-flight
+/// invocation (it holds its own reference), so poll rather than assert
+/// immediately.
+#[test]
+fn wakeup_closure_released_once_on_drop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mpv = headless();
+    let guard = CountDrop(Arc::clone(&drops));
+    mpv.set_wakeup_callback(move || {
+        let _keepalive = &guard;
+    });
+    // Generate events so the callback actually gets dispatched.
+    mpv.observe_property(31, "volume", Format::Double).unwrap();
+    mpv.set_property("volume", 41.0).unwrap();
+
+    drop(mpv);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match drops.load(Ordering::SeqCst) {
+            0 => assert!(Instant::now() < deadline, "closure never released"),
+            1 => break,
+            n => panic!("closure released {n} times"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // And it stays released exactly once.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// Replacing the wakeup callback while events are flowing frees every
+/// replaced closure exactly once — exercises the slot's set/clear
+/// serialization against concurrent dispatch.
+#[test]
+fn replaced_wakeup_closures_all_released() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const ROUNDS: usize = 100;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mpv = headless();
+    mpv.observe_property(32, "volume", Format::Double).unwrap();
+    for i in 0..ROUNDS {
+        let guard = CountDrop(Arc::clone(&drops));
+        mpv.set_wakeup_callback(move || {
+            let _keepalive = &guard;
+        });
+        // Keep events (and thus dispatches) coming while we swap.
+        mpv.set_property("volume", i as f64).unwrap();
+    }
+    mpv.clear_wakeup_callback();
+    drop(mpv);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let n = drops.load(Ordering::SeqCst);
+        assert!(n <= ROUNDS, "closures released {n} times, expected {ROUNDS}");
+        if n == ROUNDS {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {n}/{ROUNDS} closures released"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Structural-registry regression: protocol registrations belong to the
+/// core-owning `Mpv`, so creating and dropping secondary clients must not
+/// disturb them (a `Client` teardown that freed registrations would be a
+/// use-after-free once the protocol is opened).
+#[cfg(feature = "stream-cb")]
+#[test]
+fn protocol_registration_survives_client_churn() {
+    use rsmpv::stream_cb::{IoStream, Stream};
+    use rsmpv::EndFileReason;
+
+    let mut mpv = headless();
+    mpv.register_protocol("rsmpvchurn", |_| {
+        Ok(Box::new(IoStream(std::io::Cursor::new(tiny_wav()))) as Box<dyn Stream>)
+    })
+    .unwrap();
+
+    for _ in 0..3 {
+        let client = mpv.create_client(None).unwrap();
+        drop(client);
+    }
+
+    mpv.command(&["loadfile", "rsmpvchurn://x"]).unwrap();
+    let reason = wait_for(&mut mpv, 30, |ev| match ev {
+        Event::EndFile { reason, error, .. } => {
+            assert_eq!(error, None);
+            Some(reason)
+        }
+        _ => None,
+    });
+    assert_eq!(reason, EndFileReason::Eof);
+}
+
+/// clear_wakeup_callback breaks the Arc cycle a capturing closure creates.
+/// The closure is freed when its last in-flight invocation ends (clear
+/// doesn't join), so poll rather than assert immediately.
+#[test]
+fn clear_wakeup_callback_breaks_arc_cycle() {
+    use std::sync::Arc;
+
+    let mpv = Arc::new(headless());
+    let captured = Arc::clone(&mpv);
+    mpv.set_wakeup_callback(move || {
+        let _keepalive = &captured;
+    });
+    assert_eq!(Arc::strong_count(&mpv), 2);
+
+    mpv.clear_wakeup_callback();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&mpv) != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "captured Arc<Mpv> never released"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
