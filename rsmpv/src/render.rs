@@ -322,6 +322,21 @@ impl<'mpv> RenderContext<'mpv> {
         if width < 0 || height < 0 || pixels.len() < needed {
             return Err(Error::InvalidParameter);
         }
+        // mpv's software renderer (video/out/libmpv_sw.c) rejects
+        // stride < width * bytes-per-pixel (and misaligned strides) with
+        // MPV_ERROR_INVALID_PARAMETER before touching the buffer, which
+        // together with the length check above bounds every row it writes
+        // (stride * (height - 1) + width * bpp <= stride * height).
+        // Duplicate the check for the documented formats anyway, so this
+        // safe fn's soundness doesn't rest solely on validation inside the
+        // linked C library.
+        let bpp: usize = if format == "rgb24" { 3 } else { 4 };
+        let min_stride = (width as usize)
+            .checked_mul(bpp)
+            .ok_or(Error::InvalidParameter)?;
+        if stride < min_stride {
+            return Err(Error::InvalidParameter);
+        }
         let format = CString::new(format).map_err(|_| Error::InteriorNul)?;
         let mut size: [c_int; 2] = [width, height];
         let mut stride = stride;

@@ -106,6 +106,9 @@ pub enum Event {
     /// Playback of a file is starting.
     StartFile { playlist_entry_id: i64 },
     /// Playback of a file ended.
+    ///
+    /// The playlist fields are `0` when the linked libmpv predates client
+    /// API 1.108 (mpv 0.33), which lacks them.
     EndFile {
         reason: EndFileReason,
         /// Set when `reason` is [`EndFileReason::Error`].
@@ -144,6 +147,19 @@ pub enum Event {
     /// An event this crate doesn't know about (including the events
     /// deprecated upstream, `MPV_EVENT_IDLE` = 11 and `MPV_EVENT_TICK` = 14).
     Unknown(i32),
+}
+
+/// Whether the linked libmpv has the fields added in client API 1.108
+/// (mpv 0.33): the `mpv_event_end_file` playlist ids and non-null
+/// `MPV_EVENT_START_FILE` data. Cached — the linked library's version
+/// can't change at runtime.
+fn has_api_1_108() -> bool {
+    use std::sync::OnceLock;
+    static HAS: OnceLock<bool> = OnceLock::new();
+    *HAS.get_or_init(|| {
+        let v = unsafe { rsmpv_sys::mpv_client_api_version() };
+        v >= rsmpv_sys::MPV_MAKE_VERSION(1, 108)
+    })
 }
 
 unsafe fn lossy(ptr: *const std::os::raw::c_char) -> String {
@@ -224,13 +240,23 @@ impl Event {
                     .map_or(0, |sf| sf.playlist_entry_id),
             },
             rsmpv_sys::MPV_EVENT_END_FILE => {
-                let ef = &*(ev.data as *const rsmpv_sys::mpv_event_end_file);
+                // Before client API 1.108 `mpv_event_end_file` ends at
+                // `error`: read the playlist fields only when the linked
+                // libmpv has them, via raw pointer field access so no
+                // reference to the (possibly smaller) full struct is ever
+                // formed.
+                let ef = ev.data as *const rsmpv_sys::mpv_event_end_file;
+                let v108 = has_api_1_108();
                 Event::EndFile {
-                    reason: EndFileReason::from_raw(ef.reason),
-                    error: (ef.error < 0).then(|| Error::from_raw(ef.error)),
-                    playlist_entry_id: ef.playlist_entry_id,
-                    playlist_insert_id: ef.playlist_insert_id,
-                    playlist_insert_num_entries: ef.playlist_insert_num_entries,
+                    reason: EndFileReason::from_raw((*ef).reason),
+                    error: ((*ef).error < 0).then(|| Error::from_raw((*ef).error)),
+                    playlist_entry_id: if v108 { (*ef).playlist_entry_id } else { 0 },
+                    playlist_insert_id: if v108 { (*ef).playlist_insert_id } else { 0 },
+                    playlist_insert_num_entries: if v108 {
+                        (*ef).playlist_insert_num_entries
+                    } else {
+                        0
+                    },
                 }
             }
             rsmpv_sys::MPV_EVENT_FILE_LOADED => Event::FileLoaded,
