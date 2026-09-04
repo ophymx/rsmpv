@@ -15,6 +15,16 @@ fn headless() -> Mpv {
         .unwrap()
 }
 
+/// Poll `done` every 10 ms until it returns true, or panic with `what`
+/// after `secs` seconds.
+fn wait_until(secs: u64, what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Pump events until `f` returns `Some`, or panic after `secs` seconds.
 fn wait_for<T>(mpv: &mut Mpv, secs: u64, mut f: impl FnMut(Event) -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -182,11 +192,9 @@ fn wakeup_callback_fires() {
     mpv.set_wakeup_callback(move || woke2.store(true, Ordering::SeqCst));
     // Generate an event.
     mpv.observe_property(1, "volume", Format::Double).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !woke.load(Ordering::SeqCst) {
-        assert!(Instant::now() < deadline, "wakeup callback never fired");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until(10, "wakeup callback never fired", || {
+        woke.load(Ordering::SeqCst)
+    });
 }
 
 /// A minimal 16-bit mono PCM WAV file of silence.
@@ -333,7 +341,10 @@ fn panicking_wakeup_closure_drop_does_not_wedge_teardown() {
     });
 
     let result = catch_unwind(AssertUnwindSafe(move || drop(mpv)));
-    assert!(result.is_err(), "closure Drop panic should escape drop(mpv)");
+    assert!(
+        result.is_err(),
+        "closure Drop panic should escape drop(mpv)"
+    );
 
     // The core was torn down before the panic escaped; the library must
     // still be fully usable.
@@ -361,15 +372,13 @@ fn wakeup_closure_released_once_on_drop() {
     mpv.set_property("volume", 41.0).unwrap();
 
     drop(mpv);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    wait_until(10, "closure never released", || {
         match drops.load(Ordering::SeqCst) {
-            0 => assert!(Instant::now() < deadline, "closure never released"),
-            1 => break,
+            0 => false,
+            1 => true,
             n => panic!("closure released {n} times"),
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    });
     // And it stays released exactly once.
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -398,19 +407,14 @@ fn replaced_wakeup_closures_all_released() {
     mpv.clear_wakeup_callback();
     drop(mpv);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    wait_until(10, "not all closures released", || {
         let n = drops.load(Ordering::SeqCst);
-        assert!(n <= ROUNDS, "closures released {n} times, expected {ROUNDS}");
-        if n == ROUNDS {
-            break;
-        }
         assert!(
-            Instant::now() < deadline,
-            "only {n}/{ROUNDS} closures released"
+            n <= ROUNDS,
+            "closures released {n} times, expected {ROUNDS}"
         );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        n == ROUNDS
+    });
 }
 
 /// Structural-registry regression: protocol registrations belong to the
@@ -460,12 +464,7 @@ fn clear_wakeup_callback_breaks_arc_cycle() {
     assert_eq!(Arc::strong_count(&mpv), 2);
 
     mpv.clear_wakeup_callback();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Arc::strong_count(&mpv) != 1 {
-        assert!(
-            Instant::now() < deadline,
-            "captured Arc<Mpv> never released"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until(10, "captured Arc<Mpv> never released", || {
+        Arc::strong_count(&mpv) == 1
+    });
 }

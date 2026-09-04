@@ -2,27 +2,23 @@
 //!
 //! A render context makes mpv draw video into a target you control — an
 //! OpenGL framebuffer or an in-memory software surface — instead of
-//! creating its own window. Two flavors expose an identical method
-//! surface:
+//! creating its own window. [`RenderContext`] is generic over how it holds
+//! its player core (the sealed [`CoreRef`] trait):
 //!
-//! - [`RenderContext<'mpv>`] borrows the [`Mpv`]. The borrow checker
+//! - `RenderContext<&'mpv Mpv>` borrows the [`Mpv`]. The borrow checker
 //!   proves it is freed before the player terminates — the strictest and
 //!   simplest form when your render state and player live in one scope.
-//! - [`OwnedRenderContext`] holds an `Arc<Mpv>` instead of a borrow, for
-//!   owning wrappers (a struct holding the player and its render state
+//! - [`OwnedRenderContext`] (= `RenderContext<Arc<Mpv>>`) co-owns the core,
+//!   for owning wrappers (a struct holding the player and its render state
 //!   together, often behind `Arc`/`&self`) where a lifetime-carrying field
 //!   would make the struct self-referential.
-//!
-//! (The two are distinct types on purpose — no `Deref` to a common
-//! handle — so safe code can never swap the underlying renderer out from
-//! under either flavor's guarantees.)
 //!
 //! The rules inherited from the C API (and partly enforced here):
 //!
 //! - Create the context before anything causes a video output to exist
 //!   (i.e. before playing something with video), and at most one per player.
 //!   Both flavors guarantee structurally that the context is freed before
-//!   the player terminates — `RenderContext` by borrowing, and
+//!   the player terminates — the borrowed form by borrowing, and
 //!   `OwnedRenderContext` by keeping the core alive through its `Arc`.
 //! - Only one render API call may run at a time per context; the methods
 //!   take `&mut self` to encode this (an owning wrapper shares an
@@ -36,17 +32,18 @@
 //!   `mpv_render_context_free` in `Drop`**. Violating this is undefined
 //!   behavior in the C API; in practice it leaks or destroys GL objects in
 //!   whatever context happens to be current. This is a dynamic per-call
-//!   property the type system cannot capture, so both flavors make their
-//!   OpenGL constructor `unsafe` and put the obligation in its contract.
-//!   [`RenderContext`] is additionally `!Send` (a conservative
-//!   thread-affinity guard); the movable [`OwnedRenderContext`] leaves the
-//!   whole obligation to the contract. The software backend has no such
-//!   requirement anywhere, and its constructors are safe.
+//!   property the type system cannot capture, so the OpenGL constructor
+//!   ([`new_opengl`](RenderContext::new_opengl)) is `unsafe`, putting the
+//!   obligation in its contract. The borrowed flavor is additionally
+//!   `!Send` (a conservative thread-affinity guard); the movable
+//!   [`OwnedRenderContext`] leaves the whole obligation to the contract.
+//!   The software backend has no such requirement anywhere, and its
+//!   constructor is safe.
 //!
 //! # Borrowing and the event loop
 //!
-//! A live `RenderContext` holds a shared borrow of the [`Mpv`], so `&mut
-//! self` methods on that same `Mpv` — notably
+//! A live `RenderContext<&Mpv>` holds a shared borrow of the [`Mpv`], so
+//! `&mut self` methods on that same `Mpv` — notably
 //! [`wait_event`](crate::Mpv::wait_event) — become a compile error
 //! (E0502) while it exists. Two ways out: drain events with the
 //! non-blocking [`poll_event`](crate::Handle::poll_event) (takes `&self`),
@@ -54,8 +51,7 @@
 //! [`Mpv::create_client`](crate::Mpv::create_client). An
 //! [`OwnedRenderContext`] avoids the borrow entirely.
 
-use std::ffi::{c_void, CStr, CString};
-use std::marker::PhantomData;
+use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -110,6 +106,45 @@ pub struct FrameInfo {
     /// [`Handle::get_time_us`](crate::Handle::get_time_us); `0` for redraws
     /// or vsync-locked timing.
     pub target_time: i64,
+}
+
+/// Pixel format of the in-memory surface `render_software` draws into.
+///
+/// A closed set on purpose: the buffer-size check that keeps
+/// `render_software` a safe fn needs a known pixel size. mpv's
+/// undocumented internal format names are only reachable through the
+/// [`sys`](crate::sys) escape hatch, at your own risk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwPixelFormat {
+    /// `"rgb0"`: 4 bytes per pixel, R-G-B order, the `0` byte is garbage.
+    Rgb0,
+    /// `"bgr0"`: 4 bytes per pixel, B-G-R order, the `0` byte is garbage.
+    Bgr0,
+    /// `"0bgr"`: 4 bytes per pixel, garbage byte first, then B-G-R.
+    ZeroBgr,
+    /// `"0rgb"`: 4 bytes per pixel, garbage byte first, then R-G-B.
+    ZeroRgb,
+    /// `"rgb24"`: 3 bytes per pixel, R-G-B; notably slower in mpv.
+    Rgb24,
+}
+
+impl SwPixelFormat {
+    fn bytes_per_pixel(self) -> usize {
+        match self {
+            SwPixelFormat::Rgb24 => 3,
+            _ => 4,
+        }
+    }
+
+    fn as_cstr(self) -> &'static CStr {
+        match self {
+            SwPixelFormat::Rgb0 => c"rgb0",
+            SwPixelFormat::Bgr0 => c"bgr0",
+            SwPixelFormat::ZeroBgr => c"0bgr",
+            SwPixelFormat::ZeroRgb => c"0rgb",
+            SwPixelFormat::Rgb24 => c"rgb24",
+        }
+    }
 }
 
 /// The private renderer state shared by both flavors. Never public: safe
@@ -189,29 +224,20 @@ impl RenderInner {
         get_proc_address: Option<EscapedBox<GetProcAddress>>,
     ) -> Result<RenderInner> {
         let mut raw: *mut rsmpv_sys::mpv_render_context = std::ptr::null_mut();
-        let status = check(rsmpv_sys::mpv_render_context_create(
+        // On failure mpv does not retain the closure pointer, so the `?`
+        // dropping `get_proc_address` (freeing it) is sound.
+        check(rsmpv_sys::mpv_render_context_create(
             &mut raw,
             mpv,
             params.as_mut_ptr(),
-        ));
-        match (status, NonNull::new(raw)) {
-            (Ok(_), Some(raw)) => Ok(RenderInner {
-                raw,
-                _get_proc_address: get_proc_address,
-                update_slot: CallbackSlot::new(),
-            }),
-            // mpv does not retain the closure pointer on failure, so
-            // dropping `get_proc_address` (freeing it) here is sound.
-            (Err(e), _) => Err(e),
-            (Ok(_), None) => {
-                // Defensive: the C API promises a context on success. If
-                // that were ever violated there is no context to free, and
-                // whether the closure was retained is unknowable — leak it
-                // rather than risk a use-after-free.
-                std::mem::forget(get_proc_address);
-                Err(Error::CreateFailed)
-            }
-        }
+        ))?;
+        let raw = NonNull::new(raw)
+            .expect("mpv_render_context_create returned success without a context");
+        Ok(RenderInner {
+            raw,
+            _get_proc_address: get_proc_address,
+            update_slot: CallbackSlot::new(),
+        })
     }
 
     fn as_raw(&self) -> *mut rsmpv_sys::mpv_render_context {
@@ -229,20 +255,17 @@ impl RenderInner {
         });
     }
 
-    fn clear_update_callback(&mut self) {
-        drop(self.take_update_callback());
-    }
-
-    /// Unregister the update callback and hand the removed closure to the
-    /// caller instead of dropping it; `Drop` uses this to defer the
-    /// closure's `Drop` (arbitrary user code) until after
-    /// `mpv_render_context_free`, so a panic there cannot skip freeing the
-    /// context.
-    fn take_update_callback(&mut self) -> Option<crate::slot::Callback> {
+    /// Update-slot teardown for `clear_update_callback` (no-op `destroy`)
+    /// and `Drop` (the context free); see [`CallbackSlot::teardown`] for
+    /// the ordering rationale.
+    fn teardown(&mut self, destroy: impl FnOnce()) {
         let raw = self.as_raw();
-        self.update_slot.clear(|| unsafe {
-            rsmpv_sys::mpv_render_context_set_update_callback(raw, None, std::ptr::null_mut());
-        })
+        self.update_slot.teardown(
+            || unsafe {
+                rsmpv_sys::mpv_render_context_set_update_callback(raw, None, std::ptr::null_mut());
+            },
+            destroy,
+        );
     }
 
     fn update(&mut self) -> bool {
@@ -314,7 +337,7 @@ impl RenderInner {
         &mut self,
         width: i32,
         height: i32,
-        format: &str,
+        format: SwPixelFormat,
         stride: usize,
         pixels: &mut [u8],
     ) -> Result<()> {
@@ -330,23 +353,14 @@ impl RenderInner {
         // together with the length check above bounds every row it writes
         // (stride * (height - 1) + width * bpp <= stride * height).
         // Duplicate the check so this safe fn's soundness doesn't rest
-        // solely on validation inside the linked C library — which is only
-        // possible for formats whose pixel size we know, so the documented
-        // formats are the only ones accepted here (mpv's undocumented
-        // internal format names are available through the sys escape
-        // hatch, at your own risk).
-        let bpp: usize = match format {
-            "rgb0" | "bgr0" | "0bgr" | "0rgb" => 4,
-            "rgb24" => 3,
-            _ => return Err(Error::InvalidParameter),
-        };
+        // solely on validation inside the linked C library; the closed
+        // SwPixelFormat set is what makes the pixel size knowable here.
         let min_stride = (width as usize)
-            .checked_mul(bpp)
+            .checked_mul(format.bytes_per_pixel())
             .ok_or(Error::InvalidParameter)?;
         if stride < min_stride {
             return Err(Error::InvalidParameter);
         }
-        let format = CString::new(format).map_err(|_| Error::InteriorNul)?;
         let mut size: [c_int; 2] = [width, height];
         let mut stride = stride;
         let mut params = [
@@ -356,7 +370,7 @@ impl RenderInner {
             },
             rsmpv_sys::mpv_render_param {
                 type_: rsmpv_sys::MPV_RENDER_PARAM_SW_FORMAT,
-                data: format.as_ptr() as *mut c_void,
+                data: format.as_cstr().as_ptr() as *mut c_void,
             },
             rsmpv_sys::mpv_render_param {
                 type_: rsmpv_sys::MPV_RENDER_PARAM_SW_STRIDE,
@@ -382,203 +396,76 @@ impl RenderInner {
 
 impl Drop for RenderInner {
     fn drop(&mut self) {
-        // Unregister the update callback first (narrows the dispatch
-        // window), but hold the removed closure across the free: releasing
-        // it runs arbitrary user Drop code, and a panic there must not
-        // skip mpv_render_context_free — the call that ends mpv's use of
-        // the get_proc_address pointer before field drop frees it (the
-        // fields drop after this body, unwinding or not).
-        let callback = self.take_update_callback();
-        unsafe { rsmpv_sys::mpv_render_context_free(self.as_raw()) }
-        drop(callback);
+        let raw = self.as_raw();
+        self.teardown(|| unsafe { rsmpv_sys::mpv_render_context_free(raw) });
     }
 }
 
-/// Generates the identical public method surface on both context flavors.
-/// Deliberately not `Deref` to a shared handle type: `DerefMut` would let
-/// safe code `mem::swap` the renderer between wrappers with different
-/// guarantees (lifetime tie, `!Send` guard, the unsafe-constructor
-/// obligation).
-macro_rules! render_context_methods {
-    ($ty:ty) => {
-        impl $ty {
-            /// The raw `mpv_render_context` pointer, for use with
-            /// [`sys`](crate::sys) as an escape hatch. Valid as long as
-            /// `self` is.
-            pub fn as_raw(&self) -> *mut rsmpv_sys::mpv_render_context {
-                self.inner.as_raw()
-            }
-
-            /// Set the callback notifying that a new frame is available (or
-            /// a redraw is needed). It must only notify — typically waking
-            /// the render thread, which then calls [`update`](Self::update)
-            /// and, if requested, [`render_opengl`](Self::render_opengl) /
-            /// [`render_software`](Self::render_software) — and must not
-            /// call into libmpv or the render API (including this method
-            /// and [`clear_update_callback`](Self::clear_update_callback)).
-            /// Panics in the callback are caught and ignored.
-            ///
-            /// The callback runs on arbitrary mpv-internal threads, **may
-            /// be invoked synchronously on the calling thread from inside
-            /// this very call** (registration raises an update callback
-            /// immediately), and may run on several threads at once —
-            /// hence the [`Sync`] bound.
-            ///
-            /// Setting a new callback replaces the previous one; the old
-            /// closure is freed as soon as its last in-flight invocation
-            /// finishes (this method never waits for one).
-            pub fn set_update_callback(&mut self, callback: impl Fn() + Send + Sync + 'static) {
-                self.inner.set_update_callback(callback)
-            }
-
-            /// Remove the update callback; the closure is freed as soon as
-            /// its last in-flight invocation finishes (this method does
-            /// not wait for one, though the libmpv unregistration call can
-            /// briefly block while a callback is being dispatched — never
-            /// make the callback block on the thread that clears it or
-            /// drops the context). If an invocation is in flight, that
-            /// release happens on an mpv-internal thread, so captures
-            /// whose `Drop` calls into libmpv or the render API (e.g. a
-            /// last `Arc<Mpv>`) are forbidden, exactly like making those
-            /// calls from the callback itself.
-            pub fn clear_update_callback(&mut self) {
-                self.inner.clear_update_callback()
-            }
-
-            /// Process pending render work after an update callback fired
-            /// (never call it from the callback itself). Returns `true`
-            /// when a new frame must be rendered. Optional without advanced
-            /// control; mandatory with it.
-            pub fn update(&mut self) -> bool {
-                self.inner.update()
-            }
-
-            /// Information about the next frame to be rendered.
-            pub fn next_frame_info(&mut self) -> Result<FrameInfo> {
-                self.inner.next_frame_info()
-            }
-
-            /// Render the current frame (or redraw the previous one) into
-            /// the given OpenGL framebuffer. Set `flip_y` when rendering to
-            /// a target with a flipped coordinate system, such as the GL
-            /// default framebuffer. By default this blocks until the
-            /// frame's target display time; pass
-            /// `block_for_target_time = false` to return immediately (then
-            /// do your own timing, or set the `video-timing-offset`
-            /// property to `0`).
-            pub fn render_opengl(
-                &mut self,
-                fbo: OpenGlFbo,
-                flip_y: bool,
-                block_for_target_time: bool,
-            ) -> Result<()> {
-                self.inner.render_opengl(fbo, flip_y, block_for_target_time)
-            }
-
-            /// Render the current frame into an in-memory surface (software
-            /// renderer only). `format` is a pixel format name — `"rgb0"`,
-            /// `"bgr0"`, `"0bgr"`, `"0rgb"` (4 bytes per pixel, the `0`
-            /// byte is garbage) or the slow `"rgb24"`. Any other `format`
-            /// is rejected with [`Error::InvalidParameter`] before calling
-            /// into mpv: the buffer-size check that keeps this method safe
-            /// needs a known pixel size, so mpv's undocumented internal
-            /// format names are only reachable through the
-            /// [`sys`](crate::sys) escape hatch, at your own risk.
-            /// `stride` is the byte
-            /// distance between rows and must cover `width` pixels; for
-            /// performance, make the stride and the buffer start multiples
-            /// of 64. `pixels` must hold at least `stride * height` bytes.
-            pub fn render_software(
-                &mut self,
-                width: i32,
-                height: i32,
-                format: &str,
-                stride: usize,
-                pixels: &mut [u8],
-            ) -> Result<()> {
-                self.inner
-                    .render_software(width, height, format, stride, pixels)
-            }
-
-            /// Tell mpv a frame was just flipped/presented, improving frame
-            /// timing. Optional — but once used, use it consistently.
-            pub fn report_swap(&mut self) {
-                self.inner.report_swap()
-            }
-        }
-    };
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for &crate::Mpv {}
+    impl Sealed for std::sync::Arc<crate::Mpv> {}
 }
 
-/// A live mpv renderer borrowing the player (see the [module docs](self)).
+/// How a [`RenderContext`] holds its player core: a borrow (`&Mpv`) or
+/// shared ownership (`Arc<Mpv>`). Sealed — exactly those two forms exist;
+/// see the [module docs](self) for choosing between them.
+pub trait CoreRef: sealed::Sealed {
+    /// The (boxed) `get_proc_address` closure
+    /// [`new_opengl`](RenderContext::new_opengl) accepts for this core
+    /// form: plain for a borrow (the context is `!Send`, so the closure
+    /// never changes threads), `+ Send` for `Arc` (the context — and with
+    /// it the closure, which mpv may invoke during any later render
+    /// call — can move threads).
+    type GetProcAddress;
+
+    #[doc(hidden)]
+    fn handle_ptr(&self) -> *mut rsmpv_sys::mpv_handle;
+    #[doc(hidden)]
+    fn erase_gpa(gpa: Self::GetProcAddress) -> GetProcAddress;
+}
+
+impl CoreRef for &Mpv {
+    type GetProcAddress = Box<dyn FnMut(&str) -> *mut c_void + 'static>;
+    fn handle_ptr(&self) -> *mut rsmpv_sys::mpv_handle {
+        self.as_raw()
+    }
+    fn erase_gpa(gpa: Self::GetProcAddress) -> GetProcAddress {
+        gpa
+    }
+}
+
+impl CoreRef for Arc<Mpv> {
+    type GetProcAddress = Box<dyn FnMut(&str) -> *mut c_void + Send + 'static>;
+    fn handle_ptr(&self) -> *mut rsmpv_sys::mpv_handle {
+        self.as_raw()
+    }
+    fn erase_gpa(gpa: Self::GetProcAddress) -> GetProcAddress {
+        gpa
+    }
+}
+
+/// A live mpv renderer bound to a player (see the [module docs](self) for
+/// the two [`CoreRef`] flavors and the rules both must follow).
 ///
 /// For the OpenGL backend, the GL context it was created with must be
-/// current on this thread for every method call **and when the value is
-/// dropped** (drop runs `mpv_render_context_free`) — the obligation
-/// carried by the `unsafe` [`new_opengl`](RenderContext::new_opengl)
-/// contract. `!Send` additionally pins the value to its creation thread
-/// as a conservative guard. If your architecture needs to move the
-/// renderer (or store it next to the `Mpv`), use [`OwnedRenderContext`].
-pub struct RenderContext<'mpv> {
+/// current for every method call **and when the value is dropped** (drop
+/// runs `mpv_render_context_free`) — the obligation carried by the
+/// `unsafe` `new_opengl` constructors. The borrowed flavor is `!Send` as
+/// a conservative additional guard; [`OwnedRenderContext`] is [`Send`].
+///
+/// The methods take `&mut self` because libmpv requires render calls to
+/// be serialized; an owning wrapper shares an `OwnedRenderContext` by
+/// putting it behind a `Mutex` — that is the intended composition.
+pub struct RenderContext<C: CoreRef> {
+    // Declared before `core` so the renderer is freed before the core
+    // reference (and, for `Arc`, any final player termination) drops.
     inner: RenderInner,
-    _core: PhantomData<&'mpv Mpv>,
+    core: C,
 }
 
-render_context_methods!(RenderContext<'_>);
-
-impl<'mpv> RenderContext<'mpv> {
-    /// Create an OpenGL renderer. `get_proc_address` resolves GL functions
-    /// by name (wrap `glXGetProcAddressARB`, `wglGetProcAddress`, your
-    /// windowing library's loader, etc.); mpv uses only the pointers it
-    /// returns and never loads GL itself.
-    ///
-    /// `advanced_control` enables direct rendering and GPU screenshots, but
-    /// obligates you to follow the render API threading rules strictly and
-    /// to call [`update`](Self::update) promptly after every update
-    /// callback — see `MPV_RENDER_PARAM_ADVANCED_CONTROL`.
-    ///
-    /// # Safety
-    /// GL-context currency is a dynamic, per-call rule the type system
-    /// cannot capture (`!Send` only keeps the value on this thread; it
-    /// cannot keep a GL context current on it), so by calling this you
-    /// take the rule on as an obligation: **the GL context this renderer
-    /// is created with must be current on the calling thread now, on every
-    /// later method call, and when the value is dropped** (drop runs
-    /// `mpv_render_context_free`). Violating it is undefined behavior. (No
-    /// such obligation exists for [`new_software`](Self::new_software).)
-    pub unsafe fn new_opengl(
-        mpv: &'mpv Mpv,
-        advanced_control: bool,
-        get_proc_address: impl FnMut(&str) -> *mut c_void + 'static,
-    ) -> Result<RenderContext<'mpv>> {
-        // SAFETY: the handle is valid, and the borrow keeps the core alive
-        // for the inner's lifetime.
-        let inner = unsafe {
-            RenderInner::new_opengl(mpv.as_raw(), advanced_control, Box::new(get_proc_address))?
-        };
-        Ok(RenderContext {
-            inner,
-            _core: PhantomData,
-        })
-    }
-
-    /// Create a software renderer that draws into caller-provided memory
-    /// via [`render_software`](Self::render_software). Simple but slow
-    /// (everything runs on one CPU thread); mpv recommends it only as a
-    /// last resort.
-    pub fn new_software(mpv: &'mpv Mpv) -> Result<RenderContext<'mpv>> {
-        // SAFETY: the handle is valid, and the borrow keeps the core alive
-        // for the inner's lifetime.
-        let inner = unsafe { RenderInner::new_software(mpv.as_raw())? };
-        Ok(RenderContext {
-            inner,
-            _core: PhantomData,
-        })
-    }
-}
-
-/// A live mpv renderer that co-owns the player through an `Arc`, for
-/// owning wrappers where [`RenderContext`]'s borrow would make a struct
-/// self-referential (see the [module docs](self)).
+/// A [`RenderContext`] that co-owns the player through an `Arc`, for
+/// owning wrappers where a borrow would make the struct self-referential.
 ///
 /// The `Arc` makes the required teardown ordering structural instead of
 /// disciplinary: dropping this context frees the renderer first, and the
@@ -589,26 +476,15 @@ impl<'mpv> RenderContext<'mpv> {
 /// together, a non-event). If this held the last `Arc<Mpv>`, its drop also
 /// runs the (blocking) player termination.
 ///
-/// The methods take `&mut self` because libmpv requires render calls to be
-/// serialized; an owning wrapper shares the context by putting it behind a
-/// `Mutex` — that is the intended composition.
-///
-/// # `Send` and the OpenGL contract
-///
-/// Unlike [`RenderContext`], this type is [`Send`] — that is its purpose.
-/// The OpenGL currency rule is per-call, so `Send` cannot carry it;
-/// instead, [`new_opengl`](OwnedRenderContext::new_opengl) is `unsafe` and
-/// its contract makes the caller responsible for GL currency on whichever
-/// threads the value is used and dropped. A context from
+/// Unlike the borrowed flavor this type is [`Send`] — that is its purpose.
+/// The OpenGL currency rule is per-call, so `Send` cannot carry it; the
+/// `unsafe` [`new_opengl`](OwnedRenderContext::new_opengl) contract makes
+/// the caller responsible for GL currency on whichever threads the value
+/// is used and dropped. A context from
 /// [`new_software`](OwnedRenderContext::new_software) has no thread
 /// requirements at all, so the safe constructor and `Send` are
 /// unconditionally sound for it.
-pub struct OwnedRenderContext {
-    // Declared before `core` so the renderer is freed before the Arc (and
-    // thus any final player termination) drops.
-    inner: RenderInner,
-    core: Arc<Mpv>,
-}
+pub type OwnedRenderContext = RenderContext<Arc<Mpv>>;
 
 // SAFETY: the render API is not thread-affine — render.h permits calls from
 // any thread provided they are serialized (enforced by &mut self /
@@ -616,55 +492,166 @@ pub struct OwnedRenderContext {
 // carried by the unsafe `new_opengl` constructor's contract (the safe
 // software constructor has no thread requirements). The get_proc_address
 // closure is bounded `Send` at construction (the erased type drops the
-// bound), and it is only ever invoked behind the exclusive access mpv has
-// during our serialized render calls.
-unsafe impl Send for OwnedRenderContext {}
+// bound), it is only ever invoked behind the exclusive access mpv has
+// during our serialized render calls, and Arc<Mpv> is itself Send + Sync.
+// The borrowed flavor gets no such impl: RenderContext<&Mpv> stays !Send
+// as a conservative thread-affinity guard.
+unsafe impl Send for RenderContext<Arc<Mpv>> {}
 
-render_context_methods!(OwnedRenderContext);
+impl<C: CoreRef> RenderContext<C> {
+    /// The raw `mpv_render_context` pointer, for use with
+    /// [`sys`](crate::sys) as an escape hatch. Valid as long as `self` is.
+    pub fn as_raw(&self) -> *mut rsmpv_sys::mpv_render_context {
+        self.inner.as_raw()
+    }
 
-impl OwnedRenderContext {
-    /// Create an OpenGL renderer co-owning the player. Semantics match
-    /// [`RenderContext::new_opengl`], including requiring the GL context to
-    /// be current on the calling thread. `get_proc_address` must be `Send`
-    /// because mpv may invoke it after creation, from whichever thread
-    /// later render calls run on.
+    /// Set the callback notifying that a new frame is available (or a
+    /// redraw is needed). It must only notify — typically waking the
+    /// render thread, which then calls [`update`](Self::update) and, if
+    /// requested, [`render_opengl`](Self::render_opengl) /
+    /// [`render_software`](Self::render_software) — and must not call into
+    /// libmpv or the render API (including this method and
+    /// [`clear_update_callback`](Self::clear_update_callback)). Panics in
+    /// the callback are caught and ignored.
+    ///
+    /// The callback runs on arbitrary mpv-internal threads, **may be
+    /// invoked synchronously on the calling thread from inside this very
+    /// call** (registration raises an update callback immediately), and
+    /// may run on several threads at once — hence the [`Sync`] bound.
+    ///
+    /// Setting a new callback replaces the previous one; the old closure
+    /// is freed as soon as its last in-flight invocation finishes (this
+    /// method never waits for one) — possibly on an mpv-internal thread,
+    /// so the rule about captures whose `Drop` calls into libmpv applies
+    /// to the replaced closure too (see
+    /// [`clear_update_callback`](Self::clear_update_callback)).
+    pub fn set_update_callback(&mut self, callback: impl Fn() + Send + Sync + 'static) {
+        self.inner.set_update_callback(callback)
+    }
+
+    /// Remove the update callback; the closure is freed as soon as its
+    /// last in-flight invocation finishes (this method does not wait for
+    /// one, though the libmpv unregistration call can briefly block while
+    /// a callback is being dispatched — never make the callback block on
+    /// the thread that clears it or drops the context). If an invocation
+    /// is in flight, that release happens on an mpv-internal thread, so
+    /// captures whose `Drop` calls into libmpv or the render API (e.g. a
+    /// last `Arc<Mpv>`) are forbidden, exactly like making those calls
+    /// from the callback itself.
+    pub fn clear_update_callback(&mut self) {
+        self.inner.teardown(|| ())
+    }
+
+    /// Process pending render work after an update callback fired (never
+    /// call it from the callback itself). Returns `true` when a new frame
+    /// must be rendered. Optional without advanced control; mandatory
+    /// with it.
+    pub fn update(&mut self) -> bool {
+        self.inner.update()
+    }
+
+    /// Information about the next frame to be rendered.
+    pub fn next_frame_info(&mut self) -> Result<FrameInfo> {
+        self.inner.next_frame_info()
+    }
+
+    /// Render the current frame (or redraw the previous one) into the
+    /// given OpenGL framebuffer. Set `flip_y` when rendering to a target
+    /// with a flipped coordinate system, such as the GL default
+    /// framebuffer. By default this blocks until the frame's target
+    /// display time; pass `block_for_target_time = false` to return
+    /// immediately (then do your own timing, or set the
+    /// `video-timing-offset` property to `0`).
+    pub fn render_opengl(
+        &mut self,
+        fbo: OpenGlFbo,
+        flip_y: bool,
+        block_for_target_time: bool,
+    ) -> Result<()> {
+        self.inner.render_opengl(fbo, flip_y, block_for_target_time)
+    }
+
+    /// Render the current frame into an in-memory surface (software
+    /// renderer only), in the given [`SwPixelFormat`]. `stride` is the
+    /// byte distance between rows and must cover `width` pixels; for
+    /// performance, make the stride and the buffer start multiples of 64.
+    /// `pixels` must hold at least `stride * height` bytes.
+    pub fn render_software(
+        &mut self,
+        width: i32,
+        height: i32,
+        format: SwPixelFormat,
+        stride: usize,
+        pixels: &mut [u8],
+    ) -> Result<()> {
+        self.inner
+            .render_software(width, height, format, stride, pixels)
+    }
+
+    /// Tell mpv a frame was just flipped/presented, improving frame
+    /// timing. Optional — but once used, use it consistently.
+    pub fn report_swap(&mut self) {
+        self.inner.report_swap()
+    }
+}
+
+impl<C: CoreRef> RenderContext<C> {
+    /// Create an OpenGL renderer. `core` is a `&Mpv` borrow or an
+    /// `Arc<Mpv>` (see [`CoreRef`]). `get_proc_address` resolves GL
+    /// functions by name (wrap `glXGetProcAddressARB`,
+    /// `wglGetProcAddress`, your windowing library's loader, etc., in a
+    /// `Box`); mpv uses only the pointers it returns and never loads GL
+    /// itself. For an `Arc` core the closure must be `Send`, because mpv
+    /// may invoke it during any later render call, from whichever thread
+    /// the movable context has ended up on.
+    ///
+    /// `advanced_control` enables direct rendering and GPU screenshots, but
+    /// obligates you to follow the render API threading rules strictly and
+    /// to call [`update`](Self::update) promptly after every update
+    /// callback — see `MPV_RENDER_PARAM_ADVANCED_CONTROL`.
     ///
     /// # Safety
-    /// The returned value is [`Send`], which the type system cannot
-    /// reconcile with OpenGL's dynamic rule; by calling this you take on
-    /// that rule as an obligation: **the GL context this renderer is
-    /// created with must be current on the calling thread for every method
-    /// call and when the value is dropped**, wherever the value has been
-    /// moved. Violating it is undefined behavior. (No such obligation
-    /// exists for [`new_software`](OwnedRenderContext::new_software).)
+    /// GL-context currency is a dynamic, per-call rule the type system
+    /// cannot capture, so by calling this you take it on as an obligation:
+    /// **the GL context this renderer is created with must be current on
+    /// the calling thread now, on every later method call, and when the
+    /// value is dropped** (drop runs `mpv_render_context_free`) — wherever
+    /// a movable (`Arc`-core) context has been moved; the borrowed flavor
+    /// is `!Send`, but that only pins the thread, it cannot keep a GL
+    /// context current on it. Violating the rule is undefined behavior.
+    /// (No such obligation exists for
+    /// [`new_software`](Self::new_software).)
     pub unsafe fn new_opengl(
-        core: &Arc<Mpv>,
+        core: C,
         advanced_control: bool,
-        get_proc_address: impl FnMut(&str) -> *mut c_void + Send + 'static,
-    ) -> Result<OwnedRenderContext> {
-        // SAFETY: the handle is valid, and the Arc we clone keeps the core
-        // alive for the inner's lifetime.
+        get_proc_address: C::GetProcAddress,
+    ) -> Result<RenderContext<C>> {
+        // SAFETY: the handle is valid, and the `core` field (borrow or
+        // Arc) keeps the core alive for the inner's lifetime.
         let inner = unsafe {
-            RenderInner::new_opengl(core.as_raw(), advanced_control, Box::new(get_proc_address))?
+            RenderInner::new_opengl(
+                core.handle_ptr(),
+                advanced_control,
+                C::erase_gpa(get_proc_address),
+            )?
         };
-        Ok(OwnedRenderContext {
-            inner,
-            core: Arc::clone(core),
-        })
+        Ok(RenderContext { inner, core })
     }
 
-    /// Create a software renderer co-owning the player. Semantics match
-    /// [`RenderContext::new_software`].
-    pub fn new_software(core: &Arc<Mpv>) -> Result<OwnedRenderContext> {
-        // SAFETY: the handle is valid, and the Arc we clone keeps the core
-        // alive for the inner's lifetime.
-        let inner = unsafe { RenderInner::new_software(core.as_raw())? };
-        Ok(OwnedRenderContext {
-            inner,
-            core: Arc::clone(core),
-        })
+    /// Create a software renderer that draws into caller-provided memory
+    /// via [`render_software`](Self::render_software). `core` is a `&Mpv`
+    /// borrow or an `Arc<Mpv>` (see [`CoreRef`]). Simple but slow
+    /// (everything runs on one CPU thread); mpv recommends it only as a
+    /// last resort.
+    pub fn new_software(core: C) -> Result<RenderContext<C>> {
+        // SAFETY: the handle is valid, and the `core` field (borrow or
+        // Arc) keeps the core alive for the inner's lifetime.
+        let inner = unsafe { RenderInner::new_software(core.handle_ptr())? };
+        Ok(RenderContext { inner, core })
     }
+}
 
+impl RenderContext<Arc<Mpv>> {
     /// The player core this context keeps alive.
     pub fn core(&self) -> &Arc<Mpv> {
         &self.core

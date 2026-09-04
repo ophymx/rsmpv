@@ -6,6 +6,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rsmpv::render::SwPixelFormat;
 use rsmpv::{Error, Event, Mpv};
 
 const W: usize = 64;
@@ -36,49 +37,48 @@ fn load_test_video(mpv: &Mpv) {
         .unwrap();
 }
 
-/// Outcome of [`pump_until_rendered`].
-enum Pump {
-    /// A non-black frame landed in the pixel buffer.
-    Rendered,
-    /// The synthetic source failed to load — this mpv build can't play it
-    /// (no lavfi); the test should skip.
-    LoadFailed,
-    /// The deadline expired without a non-black frame.
-    TimedOut,
-}
-
 /// Drive rendering until a non-black frame lands in memory, draining
 /// events through `drain` along the way. `step` should run
 /// `update()` + `render_software()` into the buffer (panicking on render
-/// errors) and return whether it rendered. Playback errors other than a
-/// failed load panic.
+/// errors) and return whether it rendered.
+///
+/// Panics if the deadline expires without a rendered frame, or on any
+/// playback error other than a failed load. A failed load means this mpv
+/// build can't play the lavfi source at all (nothing in this crate is on
+/// the load path), so it prints a skip note and returns — unless
+/// `RSMPV_STRICT_TESTS` is set, for CI environments where lavfi is
+/// known-present and a failed load IS a regression.
 fn pump_until_rendered(
     rx: &mpsc::Receiver<()>,
     mut drain: impl FnMut() -> Option<Event>,
     mut step: impl FnMut(&mut [u8]) -> bool,
-) -> Pump {
+) {
     let mut pixels = vec![0u8; W * H * 4];
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         while let Some(ev) = drain() {
             if let Event::EndFile { error: Some(e), .. } = ev {
-                // A load failure means the build can't play the source at
-                // all (skip); anything else is a real playback regression.
                 // A clean EndFile is NOT "no more frames coming": mpv
                 // builds that loop an unseekable stream (like av://lavfi)
-                // by reloading it emit one per lap, so keep pumping.
+                // by reloading it emit one per lap, so only errors end
+                // the pump.
                 assert_eq!(e, Error::LoadingFailed, "playback failed");
-                return Pump::LoadFailed;
+                assert!(
+                    std::env::var_os("RSMPV_STRICT_TESTS").is_none(),
+                    "lavfi source failed to load under RSMPV_STRICT_TESTS"
+                );
+                eprintln!("skipping: this mpv can't play the lavfi source");
+                return;
             }
         }
         if rx.recv_timeout(Duration::from_millis(100)).is_ok()
             && step(&mut pixels)
             && pixels.iter().any(|&b| b != 0)
         {
-            return Pump::Rendered;
+            return;
         }
     }
-    Pump::TimedOut
+    panic!("no non-black frame was rendered");
 }
 
 /// A `step` closure for [`pump_until_rendered`]: process pending render
@@ -89,7 +89,7 @@ macro_rules! render_step {
         |pixels: &mut [u8]| {
             if $render.update() {
                 $render
-                    .render_software(W as i32, H as i32, "rgb0", W * 4, pixels)
+                    .render_software(W as i32, H as i32, SwPixelFormat::Rgb0, W * 4, pixels)
                     .unwrap();
                 true
             } else {
@@ -117,11 +117,7 @@ fn software_render_produces_pixels() {
     let mut events = mpv.create_client(None).unwrap();
     load_test_video(&mpv);
 
-    match pump_until_rendered(&rx, || events.wait_event(0.0), render_step!(render)) {
-        Pump::Rendered => {}
-        Pump::LoadFailed => eprintln!("skipping: this mpv can't play the lavfi source"),
-        Pump::TimedOut => panic!("no non-black frame was rendered"),
-    }
+    pump_until_rendered(&rx, || events.wait_event(0.0), render_step!(render));
 }
 
 /// The owning-consumer shape the owned handles exist for: one Arc<Mpv>
@@ -133,7 +129,7 @@ fn owned_render_context_with_shared_event_drain() {
     use std::sync::Arc;
 
     let mpv = Arc::new(video_core());
-    let mut render = OwnedRenderContext::new_software(&mpv).unwrap();
+    let mut render = OwnedRenderContext::new_software(Arc::clone(&mpv)).unwrap();
     let (tx, rx) = mpsc::channel::<()>();
     render.set_update_callback(move || {
         let _ = tx.send(());
@@ -143,11 +139,7 @@ fn owned_render_context_with_shared_event_drain() {
     // early EndFile the way a late-created client could.
     load_test_video(&mpv);
 
-    match pump_until_rendered(&rx, || mpv.poll_event(), render_step!(render)) {
-        Pump::Rendered => {}
-        Pump::LoadFailed => eprintln!("skipping: this mpv can't play the lavfi source"),
-        Pump::TimedOut => panic!("no non-black frame was rendered"),
-    }
+    pump_until_rendered(&rx, || mpv.poll_event(), render_step!(render));
 }
 
 /// Structural teardown ordering: dropping the last user-visible Arc<Mpv>
@@ -159,7 +151,7 @@ fn owned_render_context_defers_termination() {
     use std::sync::Arc;
 
     let mpv = Arc::new(video_core());
-    let render = OwnedRenderContext::new_software(&mpv).unwrap();
+    let render = OwnedRenderContext::new_software(Arc::clone(&mpv)).unwrap();
     drop(mpv); // core stays alive through the context's Arc
     assert!(render.core().get_property::<f64>("volume").is_ok());
     drop(render); // frees the renderer, then terminates the player

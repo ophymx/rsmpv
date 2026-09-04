@@ -102,16 +102,32 @@ impl CallbackSlot {
     /// closure they were promised). An in-flight invocation keeps the
     /// closure alive until it returns, so this never waits for user code.
     ///
-    /// The removed closure is handed back rather than dropped: all locks
-    /// are released before this returns, and the caller decides when its
-    /// `Drop` (arbitrary user code) runs — the wrapper `Drop` impls defer
-    /// it until after the mpv object is destroyed, so a panic in that
-    /// `Drop` cannot skip destruction.
+    /// The removed closure is handed back rather than dropped; see
+    /// [`teardown`](CallbackSlot::teardown) for why the caller controls
+    /// its release.
     #[must_use = "dropping the closure runs user Drop code; the caller chooses when"]
     pub(crate) fn clear(&self, unregister: impl FnOnce()) -> Option<Callback> {
         let _reg = lock_ignore_poison(&self.registration);
         unregister();
         lock_ignore_poison(&self.slot).take()
+    }
+
+    /// Owner teardown: [`clear`](CallbackSlot::clear) via `unregister`,
+    /// run `destroy` (the owner's mpv destroy/terminate/free call — or a
+    /// no-op when only clearing the callback), and release the removed
+    /// closure last.
+    ///
+    /// This ordering is the crate's panic-safety story in one place:
+    /// releasing the closure runs arbitrary user `Drop` code, and a panic
+    /// there must not skip `destroy` — destruction of the mpv object is
+    /// what makes it sound for the owner's remaining fields (e.g. `Mpv`'s
+    /// protocol registry, `RenderInner`'s get_proc_address box) to drop
+    /// after it, unwinding or not. Nothing here waits for an in-flight
+    /// callback; `destroy` is what synchronizes with those.
+    pub(crate) fn teardown(&self, unregister: impl FnOnce(), destroy: impl FnOnce()) {
+        let callback = self.clear(unregister);
+        destroy();
+        drop(callback);
     }
 
     /// The C callback registered with libmpv; `ctx` is the pointer that

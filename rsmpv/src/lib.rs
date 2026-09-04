@@ -450,7 +450,10 @@ impl Handle {
     ///
     /// Only one callback is active; setting a new one replaces it, and the
     /// old closure is freed as soon as its last in-flight invocation
-    /// finishes (this method never waits for one).
+    /// finishes (this method never waits for one) — possibly on an
+    /// mpv-internal thread, so the rule about captures whose `Drop` calls
+    /// into libmpv applies to the replaced closure too (see
+    /// [`clear_wakeup_callback`](Handle::clear_wakeup_callback)).
     pub fn set_wakeup_callback(&self, callback: impl Fn() + Send + Sync + 'static) {
         self.wakeup_slot.set(callback, |ctx| unsafe {
             rsmpv_sys::mpv_set_wakeup_callback(
@@ -479,34 +482,21 @@ impl Handle {
     /// into libmpv directly. The same applies to any capture whose `Drop`
     /// calls into libmpv.
     pub fn clear_wakeup_callback(&self) {
-        drop(self.take_wakeup_callback());
+        self.teardown(|| ());
     }
 
-    /// Unregister the wakeup callback and hand the removed closure to the
-    /// caller instead of dropping it. The wrapper `Drop` impls use this to
-    /// defer the closure's `Drop` (arbitrary user code) until after their
-    /// destroy/terminate call, so a panic in that `Drop` cannot skip
-    /// destroying the handle — for `Mpv`, core termination is also what
-    /// lets the protocol registry drop safely.
-    fn take_wakeup_callback(&self) -> Option<slot::Callback> {
-        self.wakeup_slot.clear(|| unsafe {
-            rsmpv_sys::mpv_set_wakeup_callback(self.as_raw(), None, std::ptr::null_mut());
-        })
-    }
-
-    /// Shared teardown for the wrapper `Drop` impls: unregister the wakeup
-    /// callback (narrowing its dispatch window), run `destroy` (the
-    /// wrapper's `mpv_destroy`/`mpv_terminate_destroy` call), and only
-    /// then release the removed closure. The release runs arbitrary user
-    /// `Drop` code, and a panic there must not skip `destroy` — for
-    /// [`Mpv`], core termination is also what lets the protocol registry
-    /// drop safely after the `Drop` body, unwinding or not. Nothing here
-    /// waits for an in-flight callback; `destroy` is what synchronizes
-    /// with those.
+    /// Wakeup-slot teardown for the wrapper `Drop` impls (and, with a
+    /// no-op `destroy`, for [`clear_wakeup_callback`]); see
+    /// [`slot::CallbackSlot::teardown`] for the ordering rationale.
+    ///
+    /// [`clear_wakeup_callback`]: Handle::clear_wakeup_callback
     fn teardown(&self, destroy: impl FnOnce()) {
-        let callback = self.take_wakeup_callback();
-        destroy();
-        drop(callback);
+        self.wakeup_slot.teardown(
+            || unsafe {
+                rsmpv_sys::mpv_set_wakeup_callback(self.as_raw(), None, std::ptr::null_mut());
+            },
+            destroy,
+        );
     }
 
     /// Block until all pending asynchronous requests of this handle have
@@ -598,15 +588,19 @@ impl Mpv {
     ///
     /// The client borrows the `Mpv`, so it can't outlive the core (dropping
     /// the `Mpv` last is what terminates the player).
+    ///
+    /// (No weak-client variant: `mpv_create_weak_client`'s distinguishing
+    /// behavior — outliving the strong handles — is unreachable under this
+    /// borrow, so it would behave identically.)
     pub fn create_client(&self, name: Option<&str>) -> Result<Client<'_>> {
-        self.new_client(name, false)
-    }
-
-    /// Like [`create_client`](Mpv::create_client), but the handle is a weak
-    /// reference: it doesn't keep the core alive on its own and receives
-    /// [`Event::Shutdown`] when the last strong handle goes away.
-    pub fn create_weak_client(&self, name: Option<&str>) -> Result<Client<'_>> {
-        self.new_client(name, true)
+        let name = name.map(cstr).transpose()?;
+        let name_ptr = name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr());
+        let raw = unsafe { rsmpv_sys::mpv_create_client(self.as_raw(), name_ptr) };
+        let raw = NonNull::new(raw).ok_or(Error::CreateFailed)?;
+        Ok(Client {
+            inner: Handle::from_raw(raw),
+            _core: PhantomData,
+        })
     }
 
     /// Wait up to `timeout` seconds for the next event. `0.0` polls,
@@ -619,23 +613,6 @@ impl Mpv {
     /// event-loop thread its own [`Client`].
     pub fn wait_event(&mut self, timeout: f64) -> Option<Event> {
         self.inner.wait_event_impl(timeout)
-    }
-
-    fn new_client(&self, name: Option<&str>, weak: bool) -> Result<Client<'_>> {
-        let name = name.map(cstr).transpose()?;
-        let name_ptr = name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr());
-        let raw = unsafe {
-            if weak {
-                rsmpv_sys::mpv_create_weak_client(self.as_raw(), name_ptr)
-            } else {
-                rsmpv_sys::mpv_create_client(self.as_raw(), name_ptr)
-            }
-        };
-        let raw = NonNull::new(raw).ok_or(Error::CreateFailed)?;
-        Ok(Client {
-            inner: Handle::from_raw(raw),
-            _core: PhantomData,
-        })
     }
 }
 
