@@ -8,6 +8,7 @@ categories = ["multimedia::video", "api-bindings"]
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme = "../README.md"
 authors.workspace = true
 
 [features]
