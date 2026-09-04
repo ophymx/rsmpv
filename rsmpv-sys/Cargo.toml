@@ -1,0 +1,25 @@
+[package]
+name = "rsmpv-sys"
+version = "0.1.0"
+description = "Low-level FFI bindings for the libmpv client API, written from the ISC-licensed mpv client headers"
+license = "ISC"
+links = "mpv"
+keywords = ["mpv", "libmpv", "ffi", "video", "multimedia"]
+categories = ["external-ffi-bindings", "multimedia::video"]
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["render", "stream-cb"]
+## Bindings for render.h and render_gl.h (embedded video rendering).
+render = []
+## Bindings for stream_cb.h (custom stream protocols).
+stream-cb = []
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[package.metadata.docs.rs]
+all-features = true

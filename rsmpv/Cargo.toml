@@ -1,0 +1,24 @@
+[package]
+name = "rsmpv"
+version = "0.1.0"
+description = "Safe, idiomatic Rust bindings for libmpv, built on the ISC-licensed mpv client headers"
+license = "MIT OR Apache-2.0"
+keywords = ["mpv", "libmpv", "video", "multimedia", "player"]
+categories = ["multimedia::video", "api-bindings"]
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+## Safe wrapper for the render API (render.h / render_gl.h).
+render = ["rsmpv-sys/render"]
+## Safe wrapper for custom stream protocols (stream_cb.h).
+stream-cb = ["rsmpv-sys/stream-cb"]
+
+[dependencies]
+rsmpv-sys = { version = "0.1.0", path = "../rsmpv-sys", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
