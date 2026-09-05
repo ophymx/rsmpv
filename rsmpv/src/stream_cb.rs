@@ -22,8 +22,10 @@ use std::ffi::{c_void, CStr, CString};
 use std::io;
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Mutex;
 
 use crate::error::{check, Error, Result};
+use crate::escaped::EscapedBox;
 use crate::Mpv;
 
 /// A user-implemented, read-only media stream served to mpv.
@@ -71,6 +73,14 @@ impl<T: io::Read + io::Seek + Send + 'static> Stream for IoStream<T> {
 
 pub(crate) type OpenFn =
     Box<dyn Fn(&str) -> std::result::Result<Box<dyn Stream>, Error> + Send + Sync>;
+
+/// Owns the open-callback allocations registered with libmpv
+/// ([`EscapedBox`] because libmpv holds each pointer and calls through it
+/// concurrently with moves of the owning [`Mpv`]). See the
+/// `Mpv::protocols` field for why this lives on `Mpv` and not `Handle`.
+///
+/// [`Mpv`]: crate::Mpv
+pub(crate) type ProtocolRegistry = Mutex<Vec<EscapedBox<OpenFn>>>;
 
 type Cookie = Box<dyn Stream>;
 
@@ -165,20 +175,20 @@ impl Mpv {
         F: Fn(&str) -> std::result::Result<Box<dyn Stream>, Error> + Send + Sync + 'static,
     {
         let protocol = CString::new(protocol).map_err(|_| Error::InteriorNul)?;
-        let open: Box<OpenFn> = Box::new(Box::new(open));
-        let user_data = &*open as *const OpenFn as *mut c_void;
+        let open = EscapedBox::new(Box::new(Box::new(open) as OpenFn));
         check(unsafe {
             rsmpv_sys::mpv_stream_cb_add_ro(
                 self.as_raw(),
                 protocol.as_ptr(),
-                user_data,
+                open.as_ptr() as *mut c_void,
                 Some(open_trampoline),
             )
         })?;
-        // Success: mpv now holds user_data, and the registration can't be
-        // undone — keep the open function alive until after the core dies.
-        // (On failure mpv does not retain the pointer, so `open` just drops.)
-        self.protocols.lock().unwrap().push(open);
+        // Success: mpv now holds the pointer and the registration can't be
+        // undone; the registry keeps the closure alive until after the
+        // core is destroyed. (On failure mpv does not retain the pointer,
+        // so `open` dropping above just frees it.)
+        crate::lock_ignore_poison(&self.protocols).push(open);
         Ok(())
     }
 }

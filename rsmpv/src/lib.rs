@@ -35,11 +35,16 @@
 //!
 //! The libmpv client API is thread-safe, and this wrapper reflects that:
 //! [`Mpv`] (and [`Client`]) are [`Send`] and [`Sync`], and everything except
-//! [`Handle::wait_event`] takes `&self`. `wait_event` takes `&mut self`
-//! because libmpv allows only one thread at a time to wait for events on the
-//! same handle; to run the event loop on its own thread while controlling
-//! playback from others, create a [`Client`] handle per thread with
-//! [`Mpv::create_client`].
+//! [`wait_event`](Mpv::wait_event) takes `&self`. `wait_event` takes `&mut
+//! self` because libmpv allows only one thread at a time to wait for events
+//! on the same handle; to run a blocking event loop on its own thread while
+//! controlling playback from others, create a [`Client`] handle per thread
+//! with [`Mpv::create_client`]. Shared-state code that can't hold `&mut`
+//! (an `Arc<Mpv>` behind a `&self` facade) drains the queue with the
+//! non-blocking [`Handle::poll_event`] instead. Pair it with a wakeup
+//! callback that only *signals* (wakes a thread, queues a task); the drain
+//! itself must happen outside the callback — calling `poll_event` from
+//! inside it is forbidden by libmpv and deadlocks.
 //!
 //! # Licensing
 //!
@@ -62,9 +67,12 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 mod error;
+#[cfg(any(feature = "render", feature = "stream-cb"))]
+mod escaped;
 mod event;
 mod node;
 mod property;
+mod slot;
 
 #[cfg(feature = "render")]
 pub mod render;
@@ -100,12 +108,11 @@ fn cstr_args<S: AsRef<str>>(args: &[S]) -> Result<(Vec<CString>, Vec<*const c_ch
     Ok((owned, ptrs))
 }
 
-type WakeupCallback = Box<dyn Fn() + Send + 'static>;
-
-unsafe extern "C" fn wakeup_trampoline(d: *mut c_void) {
-    // The callback contract forbids unwinding out of the callback.
-    let cb = &*(d as *const WakeupCallback);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cb));
+/// Lock a mutex, ignoring poisoning: none of the crate's mutexes guard an
+/// invariant a panic could break, and a panicking callback or event decode
+/// must not wedge the handle forever.
+pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A libmpv client handle: the API surface shared by [`Mpv`], [`Client`],
@@ -115,19 +122,21 @@ unsafe extern "C" fn wakeup_trampoline(d: *mut c_void) {
 /// types.
 pub struct Handle {
     raw: NonNull<rsmpv_sys::mpv_handle>,
-    /// Wakeup callbacks ever registered on this handle. libmpv gives no way
-    /// to synchronize with a callback that may be running concurrently when
-    /// it gets replaced, so old callbacks are kept alive until the handle is
-    /// dropped.
-    // The outer Box keeps each callback at a stable address while the Vec
-    // reallocates; libmpv holds a raw pointer to the boxed value.
-    #[allow(clippy::vec_box)]
-    wakeup_callbacks: Mutex<Vec<Box<WakeupCallback>>>,
+    /// The wakeup callback slot registered with mpv (see
+    /// [`slot::CallbackSlot`] for the sharing and locking story).
+    wakeup_slot: slot::CallbackSlot,
+    /// Serializes the mpv_wait_event calls made by poll_event(&self).
+    /// wait_event(&mut self) doesn't take it: the exclusive borrow already
+    /// excludes concurrent poll_event borrows on the same handle.
+    event_lock: Mutex<()>,
 }
 
 // SAFETY: the libmpv client API is documented as thread-safe. The only
 // restriction — a single concurrent mpv_wait_event caller per handle — is
-// enforced by wait_event taking &mut self.
+// upheld two ways that cannot overlap: wait_event takes &mut self (an
+// exclusive borrow), and poll_event serializes its &self callers through
+// event_lock; the borrow rules exclude a wait_event call coexisting with
+// any poll_event borrow of the same handle.
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 
@@ -135,12 +144,19 @@ impl Handle {
     fn from_raw(raw: NonNull<rsmpv_sys::mpv_handle>) -> Handle {
         Handle {
             raw,
-            wakeup_callbacks: Mutex::new(Vec::new()),
+            wakeup_slot: slot::CallbackSlot::new(),
+            event_lock: Mutex::new(()),
         }
     }
 
     /// The raw `mpv_handle` pointer, for use with [`sys`] as an escape
     /// hatch. The pointer is valid as long as `self` is.
+    ///
+    /// If you pump `mpv_wait_event` through this pointer yourself, note
+    /// that safe code can also reach it via
+    /// [`poll_event`](Handle::poll_event) (`&self`) — external
+    /// serialization schemes that assume the only path is
+    /// [`wait_event`](Mpv::wait_event)'s `&mut self` are not valid.
     pub fn as_raw(&self) -> *mut rsmpv_sys::mpv_handle {
         self.raw.as_ptr()
     }
@@ -378,35 +394,108 @@ impl Handle {
         .map(|_| ())
     }
 
-    /// Wait up to `timeout` seconds for the next event. `0.0` polls,
-    /// negative waits indefinitely. Returns `None` on timeout or spurious
-    /// wakeup. The event is deep-copied and owned.
-    pub fn wait_event(&mut self, timeout: f64) -> Option<Event> {
+    /// Shared implementation of [`Mpv::wait_event`] and
+    /// [`Client::wait_event`] (not public: no public path yields the
+    /// `&mut Handle` it would need — the wrappers deliberately lack
+    /// `DerefMut`). `&mut self` upholds libmpv's one-waiting-thread-per-
+    /// handle rule.
+    fn wait_event_impl(&mut self, timeout: f64) -> Option<Event> {
         unsafe { Event::from_raw(rsmpv_sys::mpv_wait_event(self.as_raw(), timeout)) }
     }
 
-    /// Interrupt the current (or next) [`wait_event`](Handle::wait_event)
+    /// Return the next pending event, or `None` if the queue is empty,
+    /// without waiting for new events.
+    ///
+    /// Unlike [`wait_event`](Mpv::wait_event) this takes `&self`, so it
+    /// composes with shared ownership (`Arc<Mpv>`, `&self` facades, GUI
+    /// callbacks) — it is the natural way to drain the queue in response to
+    /// a [`set_wakeup_callback`](Handle::set_wakeup_callback) notification.
+    ///
+    /// Calls are internally serialized; concurrent callers never block on
+    /// mpv's event wait (the underlying call uses a zero timeout), only
+    /// briefly on another caller's event decode. Concurrent pollers split
+    /// the stream: each event is delivered to exactly one caller.
+    ///
+    /// Never call this from inside a wakeup callback (it calls
+    /// `mpv_wait_event`, which deadlocks there); the callback should only
+    /// signal the code that polls. And note for raw-FFI users: this method
+    /// reaches `mpv_wait_event` through `&self`, so external serialization
+    /// built on [`as_raw`](Handle::as_raw) must account for it.
+    pub fn poll_event(&self) -> Option<Event> {
+        let _guard = lock_ignore_poison(&self.event_lock);
+        // The decode to an owned Event must finish before the lock
+        // releases: mpv's event storage is only valid until the next
+        // mpv_wait_event call on this handle.
+        unsafe { Event::from_raw(rsmpv_sys::mpv_wait_event(self.as_raw(), 0.0)) }
+    }
+
+    /// Interrupt the current (or next) [`wait_event`](Mpv::wait_event)
     /// call on this handle.
     pub fn wakeup(&self) {
         unsafe { rsmpv_sys::mpv_wakeup(self.as_raw()) }
     }
 
-    /// Set a callback invoked (from arbitrary mpv-internal threads) whenever
-    /// new events are available. The callback must only notify — typically
-    /// waking your event loop, which then drains events with
-    /// [`wait_event`](Handle::wait_event) — and must not call back into
-    /// libmpv. Panics in the callback are caught and ignored.
+    /// Set a callback invoked whenever new events are available. The
+    /// callback must only notify — typically waking your event loop, which
+    /// then drains events with [`wait_event`](Mpv::wait_event) or
+    /// [`poll_event`](Handle::poll_event) — and must not call back into
+    /// libmpv (including this method and
+    /// [`clear_wakeup_callback`](Handle::clear_wakeup_callback)). Panics
+    /// in the callback are caught and ignored.
     ///
-    /// Only one callback is active; setting a new one replaces it (the old
-    /// closure is kept alive until the handle is dropped, because libmpv
-    /// offers no way to synchronize with a concurrently running callback).
-    pub fn set_wakeup_callback(&self, callback: impl Fn() + Send + 'static) {
-        let boxed: Box<WakeupCallback> = Box::new(Box::new(callback));
-        let ptr = &*boxed as *const WakeupCallback as *mut c_void;
-        self.wakeup_callbacks.lock().unwrap().push(boxed);
-        unsafe {
-            rsmpv_sys::mpv_set_wakeup_callback(self.as_raw(), Some(wakeup_trampoline), ptr);
-        }
+    /// The callback runs on arbitrary mpv-internal threads, **may be
+    /// invoked synchronously on the calling thread from inside this very
+    /// call** (libmpv raises a wakeup immediately on registration), and
+    /// may run on several threads at once — hence the [`Sync`] bound.
+    ///
+    /// Only one callback is active; setting a new one replaces it, and
+    /// the replaced closure is released under the same rules as
+    /// [`clear_wakeup_callback`](Handle::clear_wakeup_callback) — freed
+    /// when its last in-flight invocation finishes, possibly on an
+    /// mpv-internal thread.
+    pub fn set_wakeup_callback(&self, callback: impl Fn() + Send + Sync + 'static) {
+        self.wakeup_slot.set(callback, |ctx| unsafe {
+            rsmpv_sys::mpv_set_wakeup_callback(
+                self.as_raw(),
+                Some(slot::CallbackSlot::trampoline),
+                ctx,
+            );
+        });
+    }
+
+    /// Remove the wakeup callback set with
+    /// [`set_wakeup_callback`](Handle::set_wakeup_callback). The closure
+    /// is freed as soon as its last in-flight invocation finishes; this
+    /// method does not wait for one. (The libmpv unregistration call
+    /// itself can briefly block inside libmpv while a callback is being
+    /// dispatched, so never make the callback block on the thread that
+    /// clears it or drops the handle.)
+    ///
+    /// Call this to break reference cycles: a wakeup closure capturing an
+    /// `Arc<Mpv>` of its own player keeps the core alive forever until the
+    /// callback is cleared. Prefer capturing a `Weak<Mpv>`, though: if an
+    /// invocation is in flight, the closure's actual release happens when
+    /// that dispatch ends, on an mpv-internal thread — and a capture
+    /// holding the last `Arc<Mpv>` would run player termination there,
+    /// which the callback contract forbids just as it forbids calling
+    /// into libmpv directly. The same applies to any capture whose `Drop`
+    /// calls into libmpv.
+    pub fn clear_wakeup_callback(&self) {
+        self.teardown(|| ());
+    }
+
+    /// Wakeup-slot teardown for the wrapper `Drop` impls (and, with a
+    /// no-op `destroy`, for [`clear_wakeup_callback`]); see
+    /// [`slot::CallbackSlot::teardown`] for the ordering rationale.
+    ///
+    /// [`clear_wakeup_callback`]: Handle::clear_wakeup_callback
+    fn teardown(&self, destroy: impl FnOnce()) {
+        self.wakeup_slot.teardown(
+            || unsafe {
+                rsmpv_sys::mpv_set_wakeup_callback(self.as_raw(), None, std::ptr::null_mut());
+            },
+            destroy,
+        );
     }
 
     /// Block until all pending asynchronous requests of this handle have
@@ -438,18 +527,23 @@ impl Handle {
 ///
 /// Create one with [`Mpv::new`] for defaults, or [`Mpv::builder`] to set
 /// options first. Dropping the `Mpv` quits the player and blocks until the
-/// core and all clients are destroyed (`mpv_terminate_destroy`).
+/// core and all clients are destroyed (`mpv_terminate_destroy`); it also
+/// unregisters any wakeup callback (see
+/// [`clear_wakeup_callback`](Handle::clear_wakeup_callback) for the
+/// rules that apply).
 ///
 /// All player functionality is on the derefed [`Handle`].
 pub struct Mpv {
     inner: Handle,
-    /// Open functions of registered stream protocols. Registrations last
-    /// until the core dies, so these must outlive the terminate_destroy in
-    /// Drop — fields drop after the Drop impl body runs, which is exactly
+    /// Open functions of registered stream protocols. On `Mpv` — the one
+    /// wrapper whose `Drop` terminates the core — and deliberately not on
+    /// [`Handle`], so a [`Client`] structurally cannot carry registrations
+    /// that its non-terminating `mpv_destroy` drop would free while the
+    /// live core still calls them. Registrations last until the core dies,
+    /// and fields drop after the `Drop` body's terminate_destroy — exactly
     /// the required order.
     #[cfg(feature = "stream-cb")]
-    #[allow(clippy::vec_box)] // stable addresses; libmpv holds raw pointers
-    protocols: Mutex<Vec<Box<stream_cb::OpenFn>>>,
+    pub(crate) protocols: stream_cb::ProtocolRegistry,
 }
 
 impl std::ops::Deref for Mpv {
@@ -459,11 +553,13 @@ impl std::ops::Deref for Mpv {
     }
 }
 
-impl std::ops::DerefMut for Mpv {
-    fn deref_mut(&mut self) -> &mut Handle {
-        &mut self.inner
-    }
-}
+// No DerefMut: handing out `&mut Handle` would let safe code `mem::swap`
+// the underlying handles (with their wakeup slots) between wrappers with
+// different teardown semantics — e.g. swapping the main handle into a
+// `Client`, whose non-terminating `mpv_destroy` drop is the wrong teardown
+// for it, while the `Mpv` wrapper would terminate the core through the
+// client's handle. `wait_event`, the one `&mut` method, is provided
+// inherently below.
 
 impl Mpv {
     /// Create and initialize an mpv instance with default (embedding-
@@ -491,38 +587,38 @@ impl Mpv {
     ///
     /// The client borrows the `Mpv`, so it can't outlive the core (dropping
     /// the `Mpv` last is what terminates the player).
+    ///
+    /// (No weak-client variant: `mpv_create_weak_client`'s distinguishing
+    /// behavior — outliving the strong handles — is unreachable under this
+    /// borrow, so it would behave identically.)
     pub fn create_client(&self, name: Option<&str>) -> Result<Client<'_>> {
-        self.new_client(name, false)
-    }
-
-    /// Like [`create_client`](Mpv::create_client), but the handle is a weak
-    /// reference: it doesn't keep the core alive on its own and receives
-    /// [`Event::Shutdown`] when the last strong handle goes away.
-    pub fn create_weak_client(&self, name: Option<&str>) -> Result<Client<'_>> {
-        self.new_client(name, true)
-    }
-
-    fn new_client(&self, name: Option<&str>, weak: bool) -> Result<Client<'_>> {
         let name = name.map(cstr).transpose()?;
         let name_ptr = name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr());
-        let raw = unsafe {
-            if weak {
-                rsmpv_sys::mpv_create_weak_client(self.as_raw(), name_ptr)
-            } else {
-                rsmpv_sys::mpv_create_client(self.as_raw(), name_ptr)
-            }
-        };
+        let raw = unsafe { rsmpv_sys::mpv_create_client(self.as_raw(), name_ptr) };
         let raw = NonNull::new(raw).ok_or(Error::CreateFailed)?;
         Ok(Client {
             inner: Handle::from_raw(raw),
             _core: PhantomData,
         })
     }
+
+    /// Wait up to `timeout` seconds for the next event. `0.0` polls,
+    /// negative waits indefinitely. Returns `None` on timeout or spurious
+    /// wakeup. The event is deep-copied and owned.
+    ///
+    /// Takes `&mut self` because libmpv allows only one thread at a time
+    /// waiting for events on the same handle; drain from `&self` with the
+    /// non-blocking [`poll_event`](Handle::poll_event), or give each
+    /// event-loop thread its own [`Client`].
+    pub fn wait_event(&mut self, timeout: f64) -> Option<Event> {
+        self.inner.wait_event_impl(timeout)
+    }
 }
 
 impl Drop for Mpv {
     fn drop(&mut self) {
-        unsafe { rsmpv_sys::mpv_terminate_destroy(self.as_raw()) }
+        self.inner
+            .teardown(|| unsafe { rsmpv_sys::mpv_terminate_destroy(self.as_raw()) });
     }
 }
 
@@ -560,12 +656,13 @@ impl Builder {
                 // Move the handle (with its registered callbacks) out.
                 inner: unsafe { std::ptr::read(&this.inner) },
                 #[cfg(feature = "stream-cb")]
-                protocols: Mutex::new(Vec::new()),
+                protocols: stream_cb::ProtocolRegistry::default(),
             }),
             Err(e) => {
-                unsafe { rsmpv_sys::mpv_terminate_destroy(raw.as_ptr()) };
-                // Handle has no Drop of its own; this just frees its storage.
-                drop(unsafe { std::ptr::read(&this.inner) });
+                // Hand the builder back to its own Drop impl, whose
+                // teardown (unregister, terminate, then release the
+                // closure) is exactly what this failure needs.
+                drop(ManuallyDrop::into_inner(this));
                 Err(e)
             }
         }
@@ -574,7 +671,8 @@ impl Builder {
 
 impl Drop for Builder {
     fn drop(&mut self) {
-        unsafe { rsmpv_sys::mpv_terminate_destroy(self.as_raw()) }
+        self.inner
+            .teardown(|| unsafe { rsmpv_sys::mpv_terminate_destroy(self.as_raw()) });
     }
 }
 
@@ -582,7 +680,8 @@ impl Drop for Builder {
 ///
 /// Has its own event queue, observed properties, and async request state,
 /// but controls the same player. Dropping it merely detaches this client
-/// (`mpv_destroy`).
+/// (`mpv_destroy`); as with [`Mpv`], the drop unregisters any wakeup
+/// callback (see [`clear_wakeup_callback`](Handle::clear_wakeup_callback)).
 pub struct Client<'core> {
     inner: Handle,
     _core: PhantomData<&'core Mpv>,
@@ -595,14 +694,20 @@ impl std::ops::Deref for Client<'_> {
     }
 }
 
-impl std::ops::DerefMut for Client<'_> {
-    fn deref_mut(&mut self) -> &mut Handle {
-        &mut self.inner
+// No DerefMut — see the comment on `Mpv`. `wait_event` is inherent.
+
+impl Client<'_> {
+    /// Wait up to `timeout` seconds for the next event; see
+    /// [`Mpv::wait_event`]. Takes `&mut self` because libmpv allows
+    /// only one waiting thread per handle.
+    pub fn wait_event(&mut self, timeout: f64) -> Option<Event> {
+        self.inner.wait_event_impl(timeout)
     }
 }
 
 impl Drop for Client<'_> {
     fn drop(&mut self) {
-        unsafe { rsmpv_sys::mpv_destroy(self.as_raw()) }
+        self.inner
+            .teardown(|| unsafe { rsmpv_sys::mpv_destroy(self.as_raw()) });
     }
 }

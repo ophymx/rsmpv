@@ -1,7 +1,7 @@
 ISC License
 
 Copyright (C) 2017-2018 the mpv developers
-Copyright (C) 2026 abic <abic@ophymx.com>
+Copyright (C) 2026 Jeffrey T. Peckham (Ophymx)
 
 These bindings are derived from the client API headers of the mpv project
 (client.h, render.h, render_gl.h, stream_cb.h), which are licensed under the
