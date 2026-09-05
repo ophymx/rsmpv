@@ -291,17 +291,16 @@ fn poll_event_from_shared_reference() {
     let drained = {
         let mpv = Arc::clone(&mpv);
         std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if let Some(Event::PropertyChange { userdata: 21, .. }) = mpv.poll_event() {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            false
+            wait_until(10, "no event drained via &self", || {
+                matches!(
+                    mpv.poll_event(),
+                    Some(Event::PropertyChange { userdata: 21, .. })
+                )
+            });
         })
     };
-    assert!(drained.join().unwrap(), "no event drained via &self");
+    // A wait_until timeout in the thread propagates through the join.
+    drained.join().unwrap();
 
     // Empty queue: poll never blocks and reports None.
     while mpv.poll_event().is_some() {}

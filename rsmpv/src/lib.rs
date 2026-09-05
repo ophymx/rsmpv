@@ -448,12 +448,11 @@ impl Handle {
     /// call** (libmpv raises a wakeup immediately on registration), and
     /// may run on several threads at once — hence the [`Sync`] bound.
     ///
-    /// Only one callback is active; setting a new one replaces it, and the
-    /// old closure is freed as soon as its last in-flight invocation
-    /// finishes (this method never waits for one) — possibly on an
-    /// mpv-internal thread, so the rule about captures whose `Drop` calls
-    /// into libmpv applies to the replaced closure too (see
-    /// [`clear_wakeup_callback`](Handle::clear_wakeup_callback)).
+    /// Only one callback is active; setting a new one replaces it, and
+    /// the replaced closure is released under the same rules as
+    /// [`clear_wakeup_callback`](Handle::clear_wakeup_callback) — freed
+    /// when its last in-flight invocation finishes, possibly on an
+    /// mpv-internal thread.
     pub fn set_wakeup_callback(&self, callback: impl Fn() + Send + Sync + 'static) {
         self.wakeup_slot.set(callback, |ctx| unsafe {
             rsmpv_sys::mpv_set_wakeup_callback(
@@ -529,9 +528,9 @@ impl Handle {
 /// Create one with [`Mpv::new`] for defaults, or [`Mpv::builder`] to set
 /// options first. Dropping the `Mpv` quits the player and blocks until the
 /// core and all clients are destroyed (`mpv_terminate_destroy`); it also
-/// unregisters any wakeup callback, which can briefly block while a
-/// callback is being dispatched — never make a wakeup callback block on
-/// the thread that drops the handle.
+/// unregisters any wakeup callback (see
+/// [`clear_wakeup_callback`](Handle::clear_wakeup_callback) for the
+/// rules that apply).
 ///
 /// All player functionality is on the derefed [`Handle`].
 pub struct Mpv {
@@ -682,7 +681,7 @@ impl Drop for Builder {
 /// Has its own event queue, observed properties, and async request state,
 /// but controls the same player. Dropping it merely detaches this client
 /// (`mpv_destroy`); as with [`Mpv`], the drop unregisters any wakeup
-/// callback, which can briefly block while a callback is being dispatched.
+/// callback (see [`clear_wakeup_callback`](Handle::clear_wakeup_callback)).
 pub struct Client<'core> {
     inner: Handle,
     _core: PhantomData<&'core Mpv>,

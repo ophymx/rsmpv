@@ -4,9 +4,10 @@
 #![cfg(feature = "render")]
 
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rsmpv::render::SwPixelFormat;
+use rsmpv::render::{CoreRef, OwnedRenderContext, RenderContext, SwPixelFormat};
 use rsmpv::{Error, Event, Mpv};
 
 const W: usize = 64;
@@ -83,29 +84,24 @@ fn pump_until_rendered(
     panic!("no non-black frame was rendered");
 }
 
-/// A `step` closure for [`pump_until_rendered`]: process pending render
-/// work and, when a frame is due, render it (unwrap surfaces real renderer
-/// regressions immediately instead of a timeout).
-macro_rules! render_step {
-    ($render:ident) => {
-        |pixels: &mut [u8]| {
-            if $render.update() {
-                $render
-                    .render_software(W as i32, H as i32, SwPixelFormat::Rgb0, W * 4, pixels)
-                    .unwrap();
-                true
-            } else {
-                false
-            }
-        }
-    };
+/// A `step` body for [`pump_until_rendered`]: process pending render work
+/// and, when a frame is due, render it (unwrap surfaces real renderer
+/// regressions immediately instead of a timeout). Generic over the
+/// context flavor via [`CoreRef`].
+fn render_step<C: CoreRef>(render: &mut RenderContext<C>, pixels: &mut [u8]) -> bool {
+    if render.update() {
+        render
+            .render_software(W as i32, H as i32, SwPixelFormat::Rgb0, W * 4, pixels)
+            .unwrap();
+        true
+    } else {
+        false
+    }
 }
 
 /// Borrowed context, blocking event loop on a secondary client handle.
 #[test]
 fn software_render_produces_pixels() {
-    use rsmpv::render::RenderContext;
-
     let mpv = video_core();
     let mut render = RenderContext::new_software(&mpv).unwrap();
     let (tx, rx) = mpsc::channel::<()>();
@@ -119,7 +115,11 @@ fn software_render_produces_pixels() {
     let mut events = mpv.create_client(None).unwrap();
     load_test_video(&mpv);
 
-    pump_until_rendered(&rx, || events.wait_event(0.0), render_step!(render));
+    pump_until_rendered(
+        &rx,
+        || events.wait_event(0.0),
+        |pixels| render_step(&mut render, pixels),
+    );
 }
 
 /// The owning-consumer shape the owned handles exist for: one Arc<Mpv>
@@ -127,9 +127,6 @@ fn software_render_produces_pixels() {
 /// (and no secondary Client) anywhere.
 #[test]
 fn owned_render_context_with_shared_event_drain() {
-    use rsmpv::render::OwnedRenderContext;
-    use std::sync::Arc;
-
     let mpv = Arc::new(video_core());
     let mut render = OwnedRenderContext::new_software(Arc::clone(&mpv)).unwrap();
     let (tx, rx) = mpsc::channel::<()>();
@@ -141,7 +138,11 @@ fn owned_render_context_with_shared_event_drain() {
     // early EndFile the way a late-created client could.
     load_test_video(&mpv);
 
-    pump_until_rendered(&rx, || mpv.poll_event(), render_step!(render));
+    pump_until_rendered(
+        &rx,
+        || mpv.poll_event(),
+        |pixels| render_step(&mut render, pixels),
+    );
 }
 
 /// Structural teardown ordering: dropping the last user-visible Arc<Mpv>
@@ -149,18 +150,9 @@ fn owned_render_context_with_shared_event_drain() {
 /// then frees the renderer and terminates the player, without deadlock.
 #[test]
 fn owned_render_context_defers_termination() {
-    use rsmpv::render::OwnedRenderContext;
-    use std::sync::Arc;
-
     let mpv = Arc::new(video_core());
     let render = OwnedRenderContext::new_software(Arc::clone(&mpv)).unwrap();
     drop(mpv); // core stays alive through the context's Arc
     assert!(render.core().get_property::<f64>("volume").is_ok());
     drop(render); // frees the renderer, then terminates the player
-}
-
-#[test]
-fn owned_render_context_is_send() {
-    fn assert_send<T: Send>() {}
-    assert_send::<rsmpv::render::OwnedRenderContext>();
 }

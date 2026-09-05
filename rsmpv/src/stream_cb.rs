@@ -76,27 +76,11 @@ pub(crate) type OpenFn =
 
 /// Owns the open-callback allocations registered with libmpv
 /// ([`EscapedBox`] because libmpv holds each pointer and calls through it
-/// concurrently with moves of the owning [`Mpv`]).
+/// concurrently with moves of the owning [`Mpv`]). See the
+/// `Mpv::protocols` field for why this lives on `Mpv` and not `Handle`.
 ///
-/// Lives on [`Mpv`] — the one wrapper whose `Drop` terminates the core —
-/// and deliberately not on [`Handle`]: registrations must outlive the
-/// core, and only `Mpv`'s field-drop order (terminate_destroy in the
-/// `Drop` body, fields after) guarantees that. On `Handle` every `Client`
-/// would carry a registry too, and its non-terminating `mpv_destroy` drop
-/// would free registered closures while the live core still calls them.
-///
-/// [`Handle`]: crate::Handle
 /// [`Mpv`]: crate::Mpv
-#[derive(Default)]
-pub(crate) struct ProtocolRegistry {
-    fns: Mutex<Vec<EscapedBox<OpenFn>>>,
-}
-
-impl ProtocolRegistry {
-    fn insert(&self, open: EscapedBox<OpenFn>) {
-        crate::lock_ignore_poison(&self.fns).push(open);
-    }
-}
+pub(crate) type ProtocolRegistry = Mutex<Vec<EscapedBox<OpenFn>>>;
 
 type Cookie = Box<dyn Stream>;
 
@@ -204,7 +188,7 @@ impl Mpv {
         // undone; the registry keeps the closure alive until after the
         // core is destroyed. (On failure mpv does not retain the pointer,
         // so `open` dropping above just frees it.)
-        self.protocols.insert(open);
+        crate::lock_ignore_poison(&self.protocols).push(open);
         Ok(())
     }
 }

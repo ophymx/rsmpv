@@ -21,9 +21,8 @@
 //!   the player terminates — the borrowed form by borrowing, and
 //!   `OwnedRenderContext` by keeping the core alive through its `Arc`.
 //! - Only one render API call may run at a time per context; the methods
-//!   take `&mut self` to encode this (an owning wrapper shares an
-//!   `OwnedRenderContext` by putting it behind a `Mutex` — that is the
-//!   intended composition, not a workaround).
+//!   take `&mut self` to encode this (see the [`RenderContext`] docs for
+//!   the intended sharing composition).
 //! - The update callback runs on arbitrary mpv-internal threads and must
 //!   only notify (e.g. wake the render thread); it must not call into
 //!   libmpv or the render API.
@@ -514,10 +513,12 @@ pub type OwnedRenderContext = RenderContext<Arc<Mpv>>;
 unsafe impl Send for RenderContext<Arc<Mpv>> {}
 
 // Structurally tie the impl above to the bound it relies on: this stops
-// compiling if <Arc<Mpv> as CoreRef>::GetProcAddress ever loses `+ Send`.
+// compiling if <Arc<Mpv> as CoreRef>::GetProcAddress ever loses `+ Send`,
+// and pins the public promise that OwnedRenderContext is Send.
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<<Arc<Mpv> as CoreRef>::GetProcAddress>();
+    assert_send::<OwnedRenderContext>();
 };
 
 impl<C: CoreRef> RenderContext<C> {
@@ -541,12 +542,11 @@ impl<C: CoreRef> RenderContext<C> {
     /// call** (registration raises an update callback immediately), and
     /// may run on several threads at once — hence the [`Sync`] bound.
     ///
-    /// Setting a new callback replaces the previous one; the old closure
-    /// is freed as soon as its last in-flight invocation finishes (this
-    /// method never waits for one) — possibly on an mpv-internal thread,
-    /// so the rule about captures whose `Drop` calls into libmpv applies
-    /// to the replaced closure too (see
-    /// [`clear_update_callback`](Self::clear_update_callback)).
+    /// Setting a new callback replaces the previous one; the replaced
+    /// closure is released under the same rules as
+    /// [`clear_update_callback`](Self::clear_update_callback) — freed
+    /// when its last in-flight invocation finishes, possibly on an
+    /// mpv-internal thread.
     pub fn set_update_callback(&mut self, callback: impl Fn() + Send + Sync + 'static) {
         self.inner.set_update_callback(callback)
     }
@@ -667,11 +667,10 @@ impl<C: CoreRef> RenderContext<C> {
 
     /// Create a software renderer that draws into caller-provided memory
     /// via [`render_software`](Self::render_software). `core` is a `&Mpv`
-    /// borrow or an `Arc<Mpv>` (see [`CoreRef`]); on error it is dropped
-    /// with the rest of the failed construction, so for an `Arc` core
-    /// pass a clone (as usual) rather than your last reference. Simple
-    /// but slow (everything runs on one CPU thread); mpv recommends it
-    /// only as a last resort.
+    /// borrow or an `Arc<Mpv>` (see [`CoreRef`]); on error it is dropped —
+    /// see [`new_opengl`](Self::new_opengl)'s note about passing an `Arc`
+    /// clone. Simple but slow (everything runs on one CPU thread); mpv
+    /// recommends it only as a last resort.
     pub fn new_software(core: C) -> Result<RenderContext<C>> {
         // SAFETY: the handle is valid, and the `core` field (borrow or
         // Arc) keeps the core alive for the inner's lifetime.

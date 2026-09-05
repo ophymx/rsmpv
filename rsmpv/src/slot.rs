@@ -38,17 +38,17 @@ type Slot = Mutex<Option<Callback>>;
 ///
 /// - Invocations may run concurrently (hence the `Sync` bound on stored
 ///   closures) and never hold a lock user code can observe.
-/// - [`set`](CallbackSlot::set) / [`clear`](CallbackSlot::clear) never
-///   wait for a running closure: a replaced or removed closure is simply
-///   released, and its memory is freed when the last in-flight invocation
-///   drops its clone.
-/// - `set` and `clear` serialize against each other (slot update plus the
-///   libmpv registration call) through a separate registration lock the
-///   trampoline never takes, so the registered state and the stored
-///   closure cannot diverge under concurrent set/clear.
+/// - [`set`](CallbackSlot::set) / [`teardown`](CallbackSlot::teardown)
+///   never wait for a running closure: a replaced or removed closure is
+///   simply released, and its memory is freed when the last in-flight
+///   invocation drops its clone.
+/// - `set` and `teardown` serialize against each other (slot update plus
+///   the libmpv registration call) through a separate registration lock
+///   the trampoline never takes, so the registered state and the stored
+///   closure cannot diverge under concurrent use.
 pub(crate) struct CallbackSlot {
     slot: Arc<Slot>,
-    /// Serializes `set`/`clear` against each other across their FFI
+    /// Serializes `set`/`teardown` against each other across their FFI
     /// registration call; never taken by the trampoline, so holding it
     /// across the FFI call cannot deadlock with a (possibly synchronous)
     /// callback dispatch. (A user callback calling set/clear from *inside*
@@ -96,37 +96,31 @@ impl CallbackSlot {
         drop(previous);
     }
 
-    /// Unregister with libmpv via `unregister`, then remove the stored
-    /// closure, both under the registration lock (mirroring
-    /// [`set`](CallbackSlot::set)'s order: no new dispatches can start
-    /// once `unregister` returns, and dispatches before it still find the
-    /// closure they were promised). An in-flight invocation keeps the
-    /// closure alive until it returns, so this never waits for user code.
-    ///
-    /// The removed closure is handed back rather than dropped; see
-    /// [`teardown`](CallbackSlot::teardown) for why the caller controls
-    /// its release.
-    #[must_use = "dropping the closure runs user Drop code; the caller chooses when"]
-    pub(crate) fn clear(&self, unregister: impl FnOnce()) -> Option<Callback> {
-        let _reg = lock_ignore_poison(&self.registration);
-        unregister();
-        lock_ignore_poison(&self.slot).take()
-    }
-
-    /// Owner teardown: [`clear`](CallbackSlot::clear) via `unregister`,
-    /// run `destroy` (the owner's mpv destroy/terminate/free call — or a
+    /// Owner teardown: unregister with libmpv via `unregister` and remove
+    /// the stored closure (both under the registration lock), run
+    /// `destroy` (the owner's mpv destroy/terminate/free call — or a
     /// no-op when only clearing the callback), and release the removed
     /// closure last.
     ///
-    /// This ordering is the crate's panic-safety story in one place:
-    /// releasing the closure runs arbitrary user `Drop` code, and a panic
-    /// there must not skip `destroy` — destruction of the mpv object is
-    /// what makes it sound for the owner's remaining fields (e.g. `Mpv`'s
-    /// protocol registry, `RenderInner`'s get_proc_address box) to drop
-    /// after it, unwinding or not. Nothing here waits for an in-flight
-    /// callback; `destroy` is what synchronizes with those.
+    /// Unregister-then-take mirrors [`set`](CallbackSlot::set)'s order:
+    /// no new dispatches can start once `unregister` returns, and
+    /// dispatches before it still find the closure they were promised.
+    /// An in-flight invocation keeps the closure alive until it returns,
+    /// so nothing here waits for user code; `destroy` is what
+    /// synchronizes with those.
+    ///
+    /// The release ordering is the crate's panic-safety story in one
+    /// place: releasing the closure runs arbitrary user `Drop` code, and
+    /// a panic there must not skip `destroy` — destruction of the mpv
+    /// object is what makes it sound for the owner's remaining fields
+    /// (e.g. `Mpv`'s protocol registry, `RenderInner`'s get_proc_address
+    /// box) to drop after it, unwinding or not.
     pub(crate) fn teardown(&self, unregister: impl FnOnce(), destroy: impl FnOnce()) {
-        let callback = self.clear(unregister);
+        let callback = {
+            let _reg = lock_ignore_poison(&self.registration);
+            unregister();
+            lock_ignore_poison(&self.slot).take()
+        };
         destroy();
         drop(callback);
     }
