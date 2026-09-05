@@ -47,8 +47,9 @@ fn load_test_video(mpv: &Mpv) {
 /// playback error other than a failed load. A failed load means this mpv
 /// build can't play the lavfi source at all (nothing in this crate is on
 /// the load path), so it prints a skip note and returns — unless
-/// `RSMPV_STRICT_TESTS` is set, for CI environments where lavfi is
-/// known-present and a failed load IS a regression.
+/// `RSMPV_STRICT_TESTS` is enabled (set to anything but empty or `0`),
+/// for CI environments where lavfi is known-present and a failed load IS
+/// a regression.
 fn pump_until_rendered(
     rx: &mpsc::Receiver<()>,
     mut drain: impl FnMut() -> Option<Event>,

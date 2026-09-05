@@ -512,12 +512,17 @@ pub type OwnedRenderContext = RenderContext<Arc<Mpv>>;
 // as a conservative thread-affinity guard.
 unsafe impl Send for RenderContext<Arc<Mpv>> {}
 
-// Structurally tie the impl above to the bound it relies on: this stops
-// compiling if <Arc<Mpv> as CoreRef>::GetProcAddress ever loses `+ Send`,
-// and pins the public promise that OwnedRenderContext is Send.
+// Structurally tie the impl above to the premises it relies on: this
+// stops compiling if <Arc<Mpv> as CoreRef>::GetProcAddress ever loses
+// `+ Send` or if Arc<Mpv> ever stops being Send + Sync (an auto-trait
+// conclusion that a future !Send/!Sync field in Mpv would silently
+// change), and pins the public promise that OwnedRenderContext is Send.
 const _: () = {
     const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
     assert_send::<<Arc<Mpv> as CoreRef>::GetProcAddress>();
+    assert_send::<Arc<Mpv>>();
+    assert_sync::<Arc<Mpv>>();
     assert_send::<OwnedRenderContext>();
 };
 
