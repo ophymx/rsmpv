@@ -169,13 +169,19 @@ struct RenderInner {
 }
 
 impl RenderInner {
+    /// `drm_render_fd`, when `Some`, is passed to mpv via
+    /// `MPV_RENDER_PARAM_DRM_DISPLAY_V2` (`render_fd` field) — see the
+    /// public [`new_opengl_drm`](RenderContext::new_opengl_drm).
+    ///
     /// # Safety
     /// `mpv` must be a valid client handle whose core outlives the
-    /// returned value.
+    /// returned value; a `Some(fd)` must stay open for the returned
+    /// value's lifetime.
     unsafe fn new_opengl(
         mpv: *mut rsmpv_sys::mpv_handle,
         advanced_control: bool,
         get_proc_address: GetProcAddress,
+        drm_render_fd: Option<c_int>,
     ) -> Result<RenderInner> {
         // The double box is load-bearing: `ctx` must be a thin pointer,
         // so mpv is handed the address of the fat `Box<dyn>` itself (the
@@ -187,6 +193,31 @@ impl RenderInner {
             get_proc_address_ctx: gpa.as_ptr() as *mut c_void,
         };
         let mut advanced: c_int = advanced_control as c_int;
+        // Only `render_fd` matters here (mpv's VAAPI GL interop reads it);
+        // the rest of the struct describes a KMS scanout setup this path
+        // does not use. Referenced by `params` only when a fd was given.
+        let mut drm = rsmpv_sys::mpv_opengl_drm_params_v2 {
+            fd: -1,
+            crtc_id: 0,
+            connector_id: 0,
+            atomic_request_ptr: std::ptr::null_mut(),
+            render_fd: drm_render_fd.unwrap_or(-1),
+        };
+        let invalid = rsmpv_sys::mpv_render_param {
+            type_: rsmpv_sys::MPV_RENDER_PARAM_INVALID,
+            data: std::ptr::null_mut(),
+        };
+        // The 4th slot carries the DRM param when a render fd was supplied,
+        // otherwise the `INVALID` terminator: mpv stops reading there, so
+        // the trailing terminator is never touched.
+        let drm_param = if drm_render_fd.is_some() {
+            rsmpv_sys::mpv_render_param {
+                type_: rsmpv_sys::MPV_RENDER_PARAM_DRM_DISPLAY_V2,
+                data: &mut drm as *mut _ as *mut c_void,
+            }
+        } else {
+            invalid
+        };
         let mut params = [
             rsmpv_sys::mpv_render_param {
                 type_: rsmpv_sys::MPV_RENDER_PARAM_API_TYPE,
@@ -200,10 +231,8 @@ impl RenderInner {
                 type_: rsmpv_sys::MPV_RENDER_PARAM_ADVANCED_CONTROL,
                 data: &mut advanced as *mut c_int as *mut c_void,
             },
-            rsmpv_sys::mpv_render_param {
-                type_: rsmpv_sys::MPV_RENDER_PARAM_INVALID,
-                data: std::ptr::null_mut(),
-            },
+            drm_param,
+            invalid,
         ];
         Self::create(mpv, &mut params, Some(gpa))
     }
@@ -665,6 +694,48 @@ impl<C: CoreRef> RenderContext<C> {
                 core.handle_ptr(),
                 advanced_control,
                 C::erase_gpa(get_proc_address),
+                None,
+            )?
+        };
+        Ok(RenderContext { inner, core })
+    }
+
+    /// Like [`new_opengl`](Self::new_opengl) but additionally hands mpv a
+    /// DRM render node fd via `MPV_RENDER_PARAM_DRM_DISPLAY_V2`.
+    ///
+    /// This is for **headless / surfaceless** GL contexts (e.g. EGL over a
+    /// GBM render node) that want hardware video decoding. mpv's VAAPI GL
+    /// interop needs a VA display, which it normally derives from an X11 or
+    /// Wayland display it is given; with neither, it can only fall back to
+    /// `hwdec=vaapi-copy` (a full CPU readback of every decoded frame).
+    /// Given `render_fd`, mpv opens the VA display with `vaGetDisplayDRM`
+    /// and zero-copy `hwdec=vaapi` works. Not needed on a context that
+    /// already carries an X11/Wayland display, nor for KMS scanout (only
+    /// the `render_fd` field is set).
+    ///
+    /// `render_fd` should be an **independent** open of the render node
+    /// (`/dev/dri/renderD*`), not the one your GBM/EGL device already
+    /// holds: some drivers (Intel iHD) fail VA decode/export on a fd shared
+    /// with the GL driver.
+    ///
+    /// # Safety
+    /// Same GL-context-currency obligation as
+    /// [`new_opengl`](Self::new_opengl); additionally `render_fd` must stay
+    /// open for the returned context's lifetime.
+    pub unsafe fn new_opengl_drm(
+        core: C,
+        advanced_control: bool,
+        get_proc_address: C::GetProcAddress,
+        render_fd: c_int,
+    ) -> Result<RenderContext<C>> {
+        // SAFETY: as new_opengl; the core field keeps the core alive, and
+        // the caller guarantees render_fd outlives the context.
+        let inner = unsafe {
+            RenderInner::new_opengl(
+                core.handle_ptr(),
+                advanced_control,
+                C::erase_gpa(get_proc_address),
+                Some(render_fd),
             )?
         };
         Ok(RenderContext { inner, core })
